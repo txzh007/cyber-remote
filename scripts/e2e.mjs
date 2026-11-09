@@ -126,13 +126,13 @@ function titles() {
 
 function parseTitle(t) {
   const m = t?.match(
-    /msgs=(\d+) key=\[([^\]]*)\] async=\[([^\]]*)\] raw=(\d+) rawsum=\((-?\d+),(-?\d+)\) fg=(\d) cursor=\((-?\d+),(-?\d+)\)/,
+    /msgs=(\d+) key=\[([^\]]*)\] async=\[([^\]]*)\] raw=(\d+) rawsum=\((-?\d+),(-?\d+)\) fg=(\d) act=(\d)(\d) cursor=\((-?\d+),(-?\d+)\)/,
   );
   if (!m) return null;
   const set = (s) => new Set(s ? s.split(',') : []);
   return {
     msgs: +m[1], key: set(m[2]), async: set(m[3]), raw: +m[4],
-    rawsum: [+m[5], +m[6]], fg: +m[7], cursor: [+m[8], +m[9]],
+    rawsum: [+m[5], +m[6]], fg: +m[7], act: +m[8], app: +m[9], cursor: [+m[10], +m[11]],
   };
 }
 
@@ -142,7 +142,7 @@ const state = (pid) => parseTitle(titles().get(pid));
 const untouched = (a, b) =>
   JSON.stringify([a.raw, a.rawsum, a.cursor]) === JSON.stringify([b.raw, b.rawsum, b.cursor]);
 const fmt = (s) =>
-  s && `msgs=${s.msgs} key=[${[...s.key]}] async=[${[...s.async]}] raw=${s.raw} rawsum=${s.rawsum} fg=${s.fg} cursor=${s.cursor}`;
+  s && `msgs=${s.msgs} key=[${[...s.key]}] async=[${[...s.async]}] raw=${s.raw} rawsum=${s.rawsum} fg=${s.fg} act=${s.act}${s.app} cursor=${s.cursor}`;
 
 // 一个页面 = 一路:CDP 会话 + 它对应的 gametest 进程
 async function openPage(browser, port, pid) {
@@ -259,6 +259,8 @@ try {
   check('A: 收到窗口消息和 Raw Input 事件', a1.msgs > a0.msgs && a1.raw > a0.raw, `msgs ${a0.msgs}→${a1.msgs} raw ${a0.raw}→${a1.raw}`);
   check('A: Raw Input 有相对位移', a1.rawsum.some((v, i) => v !== a0.rawsum[i]), `${a0.rawsum}→${a1.rawsum}`);
   check('A: 虚拟光标动了', a1.cursor.some((v, i) => v !== a0.cursor[i]), `${a0.cursor}→${a1.cursor}`);
+  // 焦点伪装:agent 在会话第一次输入时补发 WM_ACTIVATEAPP / WM_ACTIVATE / WM_SETFOCUS
+  check('A: 收到补发的激活消息(焦点伪装)', a1.act === 1 && a1.app === 1, `act=${a1.act} app=${a1.app}`);
   const b1 = state(B.pid);
   check('B: Raw Input 和虚拟光标都没变', untouched(b0, b1), `${fmt(b0)}  →  ${fmt(b1)}`);
 
@@ -282,6 +284,7 @@ try {
   });
   const b2 = state(B.pid);
   check('B: 收到 Raw Input 事件和位移', b2.raw > b1.raw && b2.rawsum.some((v, i) => v !== b1.rawsum[i]), `raw ${b1.raw}→${b2.raw} ${b1.rawsum}→${b2.rawsum}`);
+  check('B: 收到补发的激活消息(焦点伪装)', b2.act === 1 && b2.app === 1, `act=${b2.act} app=${b2.app}`);
   const a2 = state(A.pid);
   check('A: Raw Input 和虚拟光标都没变', untouched(a1, a2), `${fmt(a1)}  →  ${fmt(a2)}`);
 
@@ -298,6 +301,38 @@ try {
   await key(A, 'keyUp', 'W');
   await key(B, 'keyUp', 'D');
   await wait('两路松开', () => state(A.pid)?.async.size === 0 && state(B.pid)?.async.size === 0);
+
+  // 阶段 4:Pointer Lock 的相对位移。无头浏览器里拿不到真实的 Pointer Lock,
+  // 所以绕过页面的锁定判断,直接往 input-fast 通道发相对消息,验证 agent 这一段:
+  // 虚拟光标按增量累加、Raw Input 就是浏览器给的增量,而且不依赖窗口消息回中的坐标
+  const rawA = state(A.pid);
+  await until('input-fast 通道就绪', () => A.page.eval('window.__channels && window.__channels.fast.readyState === "open"'));
+  // seq 必须比页面已经用过的都大,否则 agent 当作乱序旧消息丢弃
+  const sent = await A.page.eval(`(() => {
+    const m = window.__channels; const ks = [10, 10, -3];
+    m.seq += 1000;
+    ks.forEach((d) => { m.fast.send(JSON.stringify({ type: 'mouse_move', seq: ++m.seq, dx: d, dy: 0, rel: true, x: 0.5, y: 0.5 })); });
+    return ks.reduce((a, b) => a + b, 0);
+  })()`);
+  check('相对模式: 测试脚本发出非零增量', sent !== 0, `sent=${sent}`);
+  const rel = await wait('相对位移落到 gametest', () => {
+    const s = state(A.pid);
+    return s && s.rawsum[0] - rawA.rawsum[0] === sent && s;
+  });
+  check('相对模式: Raw Input 位移等于浏览器给的增量', !!rel, `rawsum ${rawA.rawsum}→${rel?.rawsum} 期望 +${sent}`);
+  // 虚拟光标是屏幕坐标(客户区位置 + 客户区原点),和绝对模式下的基准不同,
+  // 所以只验证相对阶段内部:再发一组纯正增量,光标应恰好增加这个量
+  const beforeRel = state(A.pid);
+  const more = 40;
+  await A.page.eval(`(() => { const m = window.__channels;
+    m.seq += 50; m.fast.send(JSON.stringify({ type: 'mouse_move', seq: ++m.seq, dx: ${more}, dy: 0, rel: true, x: 0.5, y: 0.5 })); })()`);
+  const relHeld = await wait('相对模式下虚拟光标跟着走', () => {
+    const s = state(A.pid);
+    return s && s.cursor[0] - beforeRel.cursor[0] === more && s;
+  }, 3000).catch(() => null);
+  const after = state(A.pid);
+  check('相对模式: 虚拟光标按增量累加(不被窗口消息重置)', !!relHeld,
+    `cursor ${beforeRel.cursor}→${after?.cursor} 期望 x +${more}`);
 
   // 整条链路(采集、编码、WebRTC、解码)最后一帧画面,留着人工看
   for (const [i, p] of pages.entries()) await saveFrame(p, `frame-${PORTS[i]}.png`);

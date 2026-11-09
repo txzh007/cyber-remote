@@ -30,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, MSG, PostQuitMessage, RI_KEY_BREAK, RI_MOUSE_LEFT_BUTTON_DOWN,
     RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP,
     RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, RegisterClassW, SetTimer,
-    SetWindowTextW, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_INPUT,
+    SetWindowTextW, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_INPUT,
     WM_KEYDOWN, WM_KILLFOCUS, WM_MOUSEFIRST, WM_MOUSELAST, WM_MOUSEWHEEL, WM_PAINT, WM_SETFOCUS,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
@@ -110,6 +110,8 @@ struct State {
     // 主机
     host_cursor: (i32, i32),
     foreground: bool,
+    /// 收到过 WM_ACTIVATEAPP(TRUE):应用级"我被切到前台"
+    app_active: bool,
     last_title: String,
 }
 
@@ -268,6 +270,10 @@ fn handle(s: &mut State, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             s.active = wparam.0 & 0xFFFF != 0;
             None
         }
+        WM_ACTIVATEAPP => {
+            s.app_active = wparam.0 != 0;
+            None
+        }
         WM_INPUT => {
             raw_input(s, lparam);
             None // 系统要求 WM_INPUT 也走 DefWindowProcW 做清理
@@ -377,7 +383,7 @@ fn update_title(s: &mut State, hwnd: HWND) {
         held.join(",")
     };
     let title = format!(
-        "gametest msgs={} key=[{}] async=[{}] raw={} rawsum=({},{}) fg={} cursor=({},{})",
+        "gametest msgs={} key=[{}] async=[{}] raw={} rawsum=({},{}) fg={} act={}{} cursor=({},{})",
         s.msg_count,
         names(&s.key_state),
         names(&s.async_state),
@@ -385,6 +391,8 @@ fn update_title(s: &mut State, hwnd: HWND) {
         s.raw_total.0,
         s.raw_total.1,
         u8::from(s.foreground),
+        u8::from(s.active),
+        u8::from(s.app_active),
         s.host_cursor.0,
         s.host_cursor.1
     );
@@ -484,7 +492,12 @@ fn draw_messages(s: &State, hdc: HDC, rc: RECT, hwnd: HWND) {
     p.line(&format!("滚轮累计 {}(一格 120)", s.wheel));
     p.line(&format!("键 {}", or_dash(&s.last_key)));
     p.line(&format!("字符 {}", or_dash(&s.typed)));
-    p.line(&format!("焦点 {}  激活 {}", yes(s.focused), yes(s.active)));
+    p.line(&format!(
+        "焦点 {}  激活 {}  应用激活 {}",
+        yes(s.focused),
+        yes(s.active),
+        yes(s.app_active)
+    ));
     // 主机光标换到本窗口坐标,注入时它不该跟着动
     let mut host = POINT { x: s.host_cursor.0, y: s.host_cursor.1 };
     unsafe {

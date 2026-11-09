@@ -23,6 +23,17 @@ const video = document.getElementById('video');
 const hud = document.getElementById('hud');
 let status = '连接中…';
 let info = '';   // agent 发来的提示,比如输入隔离是否启用
+// 游戏模式:Pointer Lock 发相对位移,给靠无限转视角的游戏用。勾选后重新连一次才生效
+let gameMode = localStorage.getItem('gameMode') === '1';
+// HUD 右上角的开关,点它就能切;勾选框放进 HUD 会挡鼠标,所以用键盘快捷键 F2
+addEventListener('keydown', e => {
+  if (e.code === 'F2') {
+    gameMode = !gameMode;
+    localStorage.setItem('gameMode', gameMode ? '1' : '0');
+    info = `游戏模式(Pointer Lock): ${gameMode ? '开' : '关'},正在重连…`;
+    setTimeout(() => location.reload(), 300);
+  }
+});
 
 // 窗口放得下时按 1 视频像素 = 1 物理像素显示,避免浏览器缩放造成的模糊;
 // 放不下时退回 contain。input.js 按元素矩形换算坐标,两种情况都适用
@@ -65,7 +76,9 @@ async function start() {
   // 数据通道要在 createOffer 之前建,offer 里才有 SCTP 段
   const fast = pc.createDataChannel('input-fast', { ordered: false, maxRetransmits: 0 });
   const key = pc.createDataChannel('input-key');
-  attachInput(video, document.getElementById('ime'), fast, key);
+  // 给自动化测试直接发消息用(见 scripts/e2e.mjs 的相对位移阶段)
+  window.__channels = { fast, key, seq: 0 };
+  attachInput(video, document.getElementById('ime'), fast, key, { pointerLock: gameMode });
   pc.ontrack = e => {
     // 低延迟优先:不攒抖动缓冲
     if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
@@ -104,6 +117,7 @@ async function start() {
         + `  丢包: ${inbound.packetsLost ?? 0}`;
       last = inbound;
     }
+    line += `\n游戏模式: ${gameMode ? '开' : '关'}(F2 切换)`;
     if (info) line += '\n' + info;
     hud.textContent = line;
   }, 1000);

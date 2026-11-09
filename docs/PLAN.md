@@ -141,12 +141,12 @@ cyber_remote/
   - 输入线程要一直 `AttachThreadInput` 挂在目标线程上,解除挂接时写进去的 Ctrl 状态会丢
   - 每条按键/按钮消息投递后等目标线程处理完(弄脏 1 像素等 `WM_PAINT`),否则回车生成的 `WM_CHAR` 会落到后面的文字之后,修饰键也可能提前松开
 - [ ] 1.4 `WM_SETCURSOR`、`WM_NCHITTEST`,光标形状回传客户端
-- [ ] 1.5 焦点伪装:`WM_ACTIVATE`、`WM_SETFOCUS`、`WM_ACTIVATEAPP`
+- [x] 1.5 焦点伪装:`WM_ACTIVATE`、`WM_SETFOCUS`、`WM_ACTIVATEAPP`(会话第一次输入时补发一次;窗口本来就在前台则不补。端到端测过 `gametest` 收到这三条。已知限制:只是补发消息,窗口并不真的获得系统焦点,`GetFocus()` 之类的 API 仍返回旧值)
 - [ ] 1.6 弹出窗口:枚举同进程顶层窗口(菜单、tooltip、对话框),合成进画面并按坐标路由输入
 - [x] 1.7 断线时释放所有按键与按钮(实测:按住 Ctrl 刷新页面,重连后打字正常)
 - [ ] 1.8 音频:WASAPI 整机环回 → Opus → 音频轨
 - [x] 1.9 `gametest` 测试程序;agent 用 `--app` 选择推流目标(2026-10-28 实测:窗口消息和 `GetKeyState` 收到注入的键鼠、Shift 组合字符和回车;`GetAsyncKeyState`、Raw Input、XInput 没有反应,符合预期;主机光标不动)
-- [ ] 1.10 浏览器游戏模式:全屏 + Pointer Lock(发相对位移)+ Keyboard Lock(Esc 等不被浏览器吃掉);手柄用 Gamepad API
+- [ ] 1.10 浏览器游戏模式:全屏 + Pointer Lock(发相对位移)+ Keyboard Lock(Esc 等不被浏览器吃掉);手柄用 Gamepad API(Pointer Lock 的发送和 agent 侧已做完,见下面进度:页面按 F2 切换游戏模式,相对增量经 `rel` 字段发到 agent,虚拟光标按增量累加,不再受窗口消息回中影响;端到端只测了协议和 agent 这一段,真实 Pointer Lock 的手感要手动验。全屏、Keyboard Lock、Gamepad 还没做)
 
 退出条件:记事本输入、选区、右键菜单、"文件"菜单正常;`gametest` 的窗口消息一行能看到全部键鼠输入;操作期间主机鼠标不动。Raw Input、`GetAsyncKeyState`、XInput 留给 Phase 2。
 

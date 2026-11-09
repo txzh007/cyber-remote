@@ -71,7 +71,8 @@ impl PeerConnectionEventHandler for Handler {
                             .and_then(|s| Input::from_json(s).map_err(|e| e.to_string()));
                         match parsed {
                             Ok(ev) => {
-                                if !matches!(ev, Input::MouseMove { .. }) {
+                                // 绝对移动太频繁,只在相对模式(Pointer Lock)下打日志
+                                if !matches!(ev, Input::MouseMove { rel: false, .. }) {
                                     tracing::debug!("{label} 收到 {ev:?}");
                                 }
                                 if input.send(ev).is_err() {

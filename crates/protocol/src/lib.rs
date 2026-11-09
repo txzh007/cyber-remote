@@ -40,7 +40,10 @@ pub const CHANNEL_INPUT_KEY: &str = "input-key";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Input {
-    MouseMove { seq: u32, x: f32, y: f32 },
+    /// `rel` 为真时 `dx`/`dy` 是鼠标相对位移(浏览器 Pointer Lock 下的 `movementX/Y`),
+    /// 此时 `x`/`y` 是虚拟光标当前所在的归一化位置,只用于按下等消息。
+    /// 为假(没有 Pointer Lock)时按绝对位置移动,字段 `x`/`y` 有效
+    MouseMove { seq: u32, x: f32, y: f32, #[serde(default)] dx: i32, #[serde(default)] dy: i32, #[serde(default)] rel: bool },
     MouseButton { button: MouseButton, down: bool, x: f32, y: f32 },
     /// 滚动量用 Windows 的单位:一格 = 120,`dy` 为正表示向上滚
     Wheel { dx: i32, dy: i32, x: f32, y: f32 },
@@ -71,6 +74,21 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_move_defaults_to_absolute() {
+        // 老客户端不带 dx/dy/rel
+        let ev = Input::from_json(r#"{"type":"mouse_move","seq":3,"x":0.5,"y":0.25}"#).unwrap();
+        assert_eq!(
+            ev,
+            Input::MouseMove { seq: 3, x: 0.5, y: 0.25, dx: 0, dy: 0, rel: false }
+        );
+        let ev = Input::from_json(
+            r#"{"type":"mouse_move","seq":4,"x":0.5,"y":0.25,"dx":7,"dy":-3,"rel":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(ev, Input::MouseMove { dx: 7, dy: -3, rel: true, .. }));
+    }
 
     #[test]
     fn input_json_matches_browser_format() {
