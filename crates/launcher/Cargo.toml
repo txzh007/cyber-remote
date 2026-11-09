@@ -1,0 +1,13 @@
+[package]
+name = "launcher"
+version.workspace = true
+edition.workspace = true
+# eframe 0.37 需要 1.95
+rust-version = "1.95"
+publish.workspace = true
+
+[dependencies]
+eframe.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true

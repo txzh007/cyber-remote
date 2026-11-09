@@ -1,0 +1,12 @@
+[package]
+name = "hook-abi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+# agent 和 hook DLL 都依赖它,只放共享内存布局,不碰 windows
+crate-type = ["rlib"]
+
+[dependencies]

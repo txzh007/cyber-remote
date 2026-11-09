@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = ["crates/agent", "crates/gametest", "crates/hook", "crates/hook-abi", "crates/launcher", "crates/protocol"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[workspace.dependencies]
+protocol = { path = "crates/protocol" }
+hook-abi = { path = "crates/hook-abi" }
+
+# webrtc-rs 0.x 的 API 变动频繁,锁死版本
+webrtc = "=0.21.1"
+rtc = "=0.21.1"
+
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
+axum = { version = "0.8.9", features = ["ws"] }
+async-trait = "0.1.92"
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+bytes = "1.12.1"
+# 启动器界面;glow 后端比 wgpu 依赖少
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+rfd = { version = "0.16.1", default-features = false }
+windows = { version = "0.62.2", features = [
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_Security",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_XboxController",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -1,0 +1,4 @@
+# webrtc-rs 0.21(rtc-mdns)用到 1.91 才稳定的 Ipv4Addr::from_octets,本机默认 1.89 编不过
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cyber_remote</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 14px system-ui, sans-serif; }
+  html, body { overflow: hidden; }
+  #video { position: fixed; left: 0; top: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #hud { position: fixed; top: 8px; left: 8px; padding: 4px 8px; background: rgba(0,0,0,.6); white-space: pre; pointer-events: none; }
+  /* 接收键盘和输入法的隐藏输入框,放在画面上方以便输入法候选窗出现在附近 */
+  #ime { position: fixed; left: 50%; top: 50%; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; resize: none; }
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline muted></video>
+<textarea id="ime" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+<div id="hud">连接中…</div>
+<script src="/input.js"></script>
+<script>
+const video = document.getElementById('video');
+const hud = document.getElementById('hud');
+let status = '连接中…';
+let info = '';   // agent 发来的提示,比如输入隔离是否启用
+
+// 窗口放得下时按 1 视频像素 = 1 物理像素显示,避免浏览器缩放造成的模糊;
+// 放不下时退回 contain。input.js 按元素矩形换算坐标,两种情况都适用
+function fitVideo() {
+  const dpr = window.devicePixelRatio || 1;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const W = Math.round(innerWidth * dpr), H = Math.round(innerHeight * dpr);
+  const s = video.style;
+  if (vw && vh && vw <= W && vh <= H) {
+    // 偏移取整到物理像素,否则半像素对齐也会触发重采样
+    s.left = Math.floor((W - vw) / 2) / dpr + 'px';
+    s.top = Math.floor((H - vh) / 2) / dpr + 'px';
+    s.width = vw / dpr + 'px';
+    s.height = vh / dpr + 'px';
+  } else {
+    s.left = s.top = '0';
+    s.width = s.height = '100%';
+  }
+}
+addEventListener('resize', fitVideo);
+video.addEventListener('resize', fitVideo);
+video.addEventListener('loadedmetadata', fitVideo);
+
+function waitGathering(pc) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(resolve => {
+    pc.addEventListener('icegatheringstatechange', () => {
+      if (pc.iceGatheringState === 'complete') resolve();
+    });
+    // 收集卡住时也别一直等
+    setTimeout(resolve, 3000);
+  });
+}
+
+async function start() {
+  // 只走本机/局域网,不需要 STUN
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  window.pc = pc;
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  // 数据通道要在 createOffer 之前建,offer 里才有 SCTP 段
+  const fast = pc.createDataChannel('input-fast', { ordered: false, maxRetransmits: 0 });
+  const key = pc.createDataChannel('input-key');
+  attachInput(video, document.getElementById('ime'), fast, key);
+  pc.ontrack = e => {
+    // 低延迟优先:不攒抖动缓冲
+    if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
+    video.srcObject = e.streams[0] || new MediaStream([e.track]);
+  };
+  pc.onconnectionstatechange = () => { status = pc.connectionState; };
+
+  await pc.setLocalDescription(await pc.createOffer());
+  await waitGathering(pc);
+
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
+  ws.onmessage = async e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'answer') {
+      await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+    } else if (msg.type === 'error') {
+      status = '错误: ' + msg.message;
+    } else if (msg.type === 'info') {
+      info = msg.text;
+    }
+  };
+  ws.onclose = () => { if (pc.connectionState !== 'connected') status = '信令已断开'; };
+
+  let last = null;
+  setInterval(async () => {
+    const stats = await pc.getStats();
+    let inbound = null;
+    stats.forEach(s => { if (s.type === 'inbound-rtp' && s.kind === 'video') inbound = s; });
+    let line = `状态: ${status}`;
+    if (inbound) {
+      const kbps = last ? ((inbound.bytesReceived - last.bytesReceived) * 8 / (inbound.timestamp - last.timestamp)).toFixed(0) : '-';
+      line += `\n分辨率: ${inbound.frameWidth || '-'}x${inbound.frameHeight || '-'}`
+        + `  fps: ${inbound.framesPerSecond ?? '-'}`
+        + `\n码率: ${kbps} kbps  已解码: ${inbound.framesDecoded ?? 0}`
+        + `  丢包: ${inbound.packetsLost ?? 0}`;
+      last = inbound;
+    }
+    if (info) line += '\n' + info;
+    hud.textContent = line;
+  }, 1000);
+}
+
+start().catch(e => { status = '错误: ' + e; hud.textContent = status; });
+</script>
+</body>
+</html>

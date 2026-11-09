@@ -1,0 +1,18 @@
+[package]
+name = "hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+# 注入目标进程的 DLL;x64 和 x86 各编一份(--target i686-pc-windows-msvc)
+name = "cyber_remote_hook"
+crate-type = ["cdylib"]
+
+[dependencies]
+hook-abi.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+minhook = "0.9.0"
+windows.workspace = true
