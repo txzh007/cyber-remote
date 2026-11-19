@@ -154,6 +154,9 @@ impl Injector {
         } else {
             post(top, WM_SETFOCUS, HWND_ABSOLUTE, 0);
         }
+        // 等目标处理完再往下走:程序多半在 WM_SETFOCUS 里才把焦点交给子控件(记事本交给编辑框),
+        // 不等的话紧跟着的按键、文字查焦点窗口还查不到,会发给顶层窗口而丢掉(实测开局直接打字丢字符)
+        sync(top);
         tracing::debug!("补发激活消息给 {top:?},焦点 {target:?}");
     }
 
