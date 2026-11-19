@@ -7,11 +7,12 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::net::{IpAddr, UdpSocket};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::ws::{Message, WebSocket};
-use protocol::{CHANNEL_INPUT_FAST, CHANNEL_INPUT_KEY, Input, Signal};
+use protocol::{CHANNEL_CONTROL, CHANNEL_INPUT_FAST, CHANNEL_INPUT_KEY, Control, Input, Signal};
 use rtc::interceptor::Registry;
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
@@ -21,7 +22,7 @@ use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MediaEng
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
-    RTCRtpEncodingParameters, RtpCodecKind,
+    RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability, RtpCodecKind,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
@@ -37,25 +38,52 @@ use webrtc::peer_connection::{
 };
 use webrtc::runtime::{Receiver, Sender, channel};
 
-use crate::capture::Pipeline;
-use crate::{inject, keyframe};
+use crate::host::{Host, InputEvent, ProbeTiming, epoch_ms};
+use crate::{keyframe, playout};
 
 const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// 首帧没有上一帧可比,按 60fps 估一个时长
 const FIRST_FRAME_DURATION: Duration = Duration::from_micros(16_667);
 
+/// control 通道:浏览器建好之前是 None
+type ControlSlot = Arc<std::sync::Mutex<Option<Arc<dyn DataChannel>>>>;
+
+/// 给视频包带 playout-delay(min = max = 0),见 playout.rs。`--no-playout-delay` 关掉,做对照测量用
+static PLAYOUT_DELAY: AtomicBool = AtomicBool::new(true);
+
+pub fn set_playout_delay(on: bool) {
+    PLAYOUT_DELAY.store(on, Ordering::Relaxed);
+}
+
 struct Handler {
     gathered: Sender<()>,
     connected: Sender<()>,
     done: Sender<()>,
-    input: std::sync::mpsc::Sender<Input>,
+    input: std::sync::mpsc::Sender<InputEvent>,
+    control: ControlSlot,
 }
 
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for Handler {
     async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
         let label = dc.label().await.unwrap_or_default();
+        if label == CHANNEL_CONTROL {
+            info!("数据通道 {label} 已建立");
+            *self.control.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&dc));
+            let control = Arc::clone(&self.control);
+            tokio::spawn(async move {
+                // 浏览器不往这条通道发东西,事件照样读走,关闭后清掉
+                while let Some(ev) = dc.poll().await {
+                    if matches!(ev, DataChannelEvent::OnClose) {
+                        break;
+                    }
+                }
+                *control.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                info!("数据通道 {CHANNEL_CONTROL} 已关闭");
+            });
+            return;
+        }
         if label != CHANNEL_INPUT_FAST && label != CHANNEL_INPUT_KEY {
             warn!("未知的数据通道 {label:?},忽略");
             return;
@@ -75,7 +103,7 @@ impl PeerConnectionEventHandler for Handler {
                                 if !matches!(ev, Input::MouseMove { rel: false, .. }) {
                                     tracing::debug!("{label} 收到 {ev:?}");
                                 }
-                                if input.send(ev).is_err() {
+                                if input.send(InputEvent::now(ev)).is_err() {
                                     break;
                                 }
                             }
@@ -87,7 +115,7 @@ impl PeerConnectionEventHandler for Handler {
                 }
             }
             // 通道断开时别留下按住的键
-            let _ = input.send(Input::ReleaseAll);
+            let _ = input.send(InputEvent::now(Input::ReleaseAll));
             info!("数据通道 {label} 已关闭");
         });
     }
@@ -115,7 +143,7 @@ impl PeerConnectionEventHandler for Handler {
 }
 
 /// 处理一条 `/ws` 连接,直到浏览器断开或 PeerConnection 结束。
-pub async fn handle_ws(mut socket: WebSocket, pipeline: Pipeline) {
+pub async fn handle_ws(mut socket: WebSocket, host: Arc<dyn Host>) {
     let offer = loop {
         match socket.recv().await {
             Some(Ok(Message::Text(t))) => match Signal::from_json(t.as_str()) {
@@ -132,7 +160,7 @@ pub async fn handle_ws(mut socket: WebSocket, pipeline: Pipeline) {
         }
     };
 
-    if let Err(e) = run(&mut socket, pipeline, offer).await {
+    if let Err(e) = run(&mut socket, host, offer).await {
         warn!("会话结束: {e:#}");
         send(&mut socket, &Signal::Error { message: format!("{e:#}") }).await;
     } else {
@@ -144,7 +172,7 @@ async fn send(socket: &mut WebSocket, sig: &Signal) {
     let _ = socket.send(Message::Text(sig.to_json().into())).await;
 }
 
-async fn run(socket: &mut WebSocket, pipeline: Pipeline, offer: String) -> Result<()> {
+async fn run(socket: &mut WebSocket, host: Arc<dyn Host>, offer: String) -> Result<()> {
     let codec = RTCRtpCodecParameters {
         rtp_codec: RTCRtpCodec {
             mime_type: MIME_TYPE_H264.to_owned(),
@@ -165,19 +193,29 @@ async fn run(socket: &mut WebSocket, pipeline: Pipeline, offer: String) -> Resul
     };
     let mut media_engine = MediaEngine::default();
     media_engine.register_codec(codec.clone(), RtpCodecKind::Video)?;
+    if PLAYOUT_DELAY.load(Ordering::Relaxed) {
+        media_engine.register_header_extension(
+            RTCRtpHeaderExtensionCapability { uri: playout::URI.to_owned() },
+            RtpCodecKind::Video,
+            None,
+        )?;
+    }
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?
-        .with(keyframe::slot(), keyframe::KeyframeRequestInterceptor::default());
+        .with(keyframe::slot(), keyframe::KeyframeRequestInterceptor::default())
+        .with(playout::slot(), playout::PlayoutDelayInterceptor::default());
 
     let (gathered_tx, gathered_rx) = channel::<()>(1);
     let (connected_tx, connected_rx) = channel::<()>(1);
     let (done_tx, done_rx) = channel::<()>(1);
     // 发送端随 PeerConnection 一起释放,输入线程随之松开所有按键并退出
-    let input = inject::spawn(pipeline.clone()).context("启动输入线程")?;
+    let input = host.open_input().context("启动输入线程")?;
+    let control = ControlSlot::default();
     let handler = Arc::new(Handler {
         gathered: gathered_tx,
         connected: connected_tx,
         done: done_tx,
         input,
+        control: Arc::clone(&control),
     });
 
     let runtime = webrtc::runtime::default_runtime().ok_or_else(|| anyhow!("webrtc 没有可用的运行时"))?;
@@ -196,7 +234,7 @@ async fn run(socket: &mut WebSocket, pipeline: Pipeline, offer: String) -> Resul
         connected: connected_rx,
         done: done_rx,
     };
-    let result = stream(socket, &pipeline, &pc, &codec, offer, &mut events).await;
+    let result = stream(socket, host.as_ref(), &control, &pc, &codec, offer, &mut events).await;
     let _ = pc.close().await;
     result
 }
@@ -210,7 +248,8 @@ struct Events {
 /// 协商并推流
 async fn stream(
     socket: &mut WebSocket,
-    pipeline: &Pipeline,
+    host: &dyn Host,
+    control: &ControlSlot,
     pc: &impl PeerConnection,
     codec: &RTCRtpCodecParameters,
     offer: String,
@@ -272,8 +311,8 @@ async fn stream(
     let ssrc = *track.ssrcs().await.first().ok_or(RtcError::ErrSenderWithNoSSRCs)?;
     info!("开始推流 ssrc={ssrc} pt={payload_type}");
 
-    let mut frames = pipeline.frames.subscribe();
-    pipeline.request_keyframe();
+    let mut frames = host.subscribe();
+    host.request_keyframe();
     let mut prev: Option<Instant> = None;
     let mut told = false;
     loop {
@@ -283,7 +322,7 @@ async fn stream(
                     // 采集线程在出第一帧之前就装完了输入隔离,这时状态是确定的
                     if !told {
                         told = true;
-                        send(socket, &Signal::Info { text: pipeline.hook_note() }).await;
+                        send(socket, &Signal::Info { text: host.status() }).await;
                     }
                     let duration = prev.map_or(FIRST_FRAME_DURATION, |p| {
                         f.captured_at
@@ -299,10 +338,13 @@ async fn stream(
                             ..Sample::new(f.captured_at)
                         })
                         .await?;
+                    if let Some(p) = f.probe {
+                        report_probe(control, p).await;
+                    }
                 }
                 Err(RecvError::Lagged(n)) => {
                     warn!("推流落后,丢了 {n} 帧,请求关键帧");
-                    pipeline.request_keyframe();
+                    host.request_keyframe();
                 }
                 Err(RecvError::Closed) => bail!("采集线程已停止"),
             },
@@ -310,7 +352,7 @@ async fn stream(
             ev = track.poll() => match ev {
                 Some(TrackLocalEvent::OnRtcpPacket(_)) => {
                     info!("浏览器请求关键帧");
-                    pipeline.request_keyframe();
+                    host.request_keyframe();
                 }
                 Some(_) => {}
                 None => {
@@ -351,4 +393,23 @@ fn udp_addrs() -> Vec<String> {
     }
     addrs.push(format!("{}:0", IpAddr::from([127, 0, 0, 1])));
     addrs
+}
+
+/// 把延迟探针在 agent 内各环节的时刻发给浏览器(PLAN 0.8)。control 通道没建就不发
+async fn report_probe(control: &ControlSlot, p: ProbeTiming) {
+    let sent = Instant::now();
+    let dc = control.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(dc) = dc else { return };
+    let msg = Control::Probe {
+        id: p.id,
+        received: epoch_ms(p.received),
+        posted: epoch_ms(p.posted),
+        composed: p.composed.map(epoch_ms),
+        captured: epoch_ms(p.captured),
+        encoded: epoch_ms(p.encoded),
+        sent: epoch_ms(sent),
+    };
+    if let Err(e) = dc.send_text(&msg.to_json()).await {
+        warn!("发送延迟探针结果失败: {e}");
+    }
 }

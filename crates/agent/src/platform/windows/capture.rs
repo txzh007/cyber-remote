@@ -12,7 +12,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use tokio::sync::broadcast;
 use windows::Foundation::TypedEventHandler;
-use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
+};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
@@ -32,6 +34,7 @@ use windows::Win32::System::WinRT::Direct3D11::{
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -43,26 +46,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, Interface, PWSTR};
 
-use crate::hooklink::{self, HookLink};
-use crate::nvenc::{self, Encoder, EncoderConfig};
+use super::compositor::{self, Canvas, Layer};
+use super::display;
+use super::hooklink::{self, HookLink};
+use super::nvenc::{self, Encoder, EncoderConfig};
+use crate::host::{EncodedFrame, ProbeTiming, Stream, Target};
 
-/// 编码参数
-#[derive(Clone, Copy, Debug)]
-pub struct Stream {
-    pub fps: u32,
-    /// bit/s
-    pub bitrate: u32,
-}
 /// 内容不变时 WGC 不出帧;隔这么久重编一次,让新加入的观众也能拿到画面
 const IDLE_REENCODE: Duration = Duration::from_millis(500);
 /// 丢包恢复靠浏览器的 PLI/FIR(见 keyframe.rs);定期 IDR 只防 PLI 也丢了的极端情况。
 /// IDR 比 P 帧大好几倍,太频繁会周期性糊一下
 const PERIODIC_IDR: Duration = Duration::from_secs(20);
 
-#[derive(Clone)]
-pub struct EncodedFrame {
-    pub data: Bytes,
-    pub captured_at: Instant,
+/// 延迟探针投递后这么久还没有新帧来认领(点击没改变画面),就丢掉
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 一次延迟探针点击(PLAN 0.8):输入线程投递消息后登记,采集线程拿到的下一帧认领它
+#[derive(Clone, Copy, Debug)]
+pub struct PendingProbe {
+    pub id: u32,
+    pub received: Instant,
+    pub posted: Instant,
 }
 
 /// 采集线程的对外句柄
@@ -73,6 +77,11 @@ pub struct Pipeline {
     /// 正在采集的窗口句柄,0 表示还没找到或已关闭。HWND 不是 Send,这里存数值
     window: Arc<AtomicIsize>,
     hook: Arc<Mutex<HookState>>,
+    probe: Arc<Mutex<Option<PendingProbe>>>,
+    /// 整屏采集时画面对应的屏幕区域(物理像素),注入按它换算坐标;None 表示画面就是窗口客户区
+    view: Arc<Mutex<Option<RECT>>>,
+    /// 整屏采集改过窗口的样式和位置,退出时还原
+    placement: Arc<Mutex<Option<display::Placement>>>,
 }
 
 /// 输入隔离的状态:连接对象,以及给浏览器 HUD 显示的一句话
@@ -110,6 +119,37 @@ impl Pipeline {
         let v = self.window.load(Ordering::Relaxed);
         (v != 0).then_some(HWND(v as *mut _))
     }
+
+    pub fn set_probe(&self, probe: PendingProbe) {
+        *self.probe.lock().unwrap_or_else(|e| e.into_inner()) = Some(probe);
+    }
+
+    /// 整屏采集时画面对应的屏幕区域,见 `view` 字段
+    pub fn view(&self) -> Option<RECT> {
+        *self.view.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 还原整屏采集改过的窗口样式和位置。可以在任意线程调用,只还原一次
+    pub fn restore_window(&self) {
+        let placement = self.placement.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(pl) = placement {
+            pl.restore();
+        }
+    }
+
+    /// 新帧认领探针。投递之前就合成好的帧(点击前已在路上的旧画面)不算;超时的直接丢掉
+    fn take_probe(&self, composed: Option<Instant>, now: Instant) -> Option<PendingProbe> {
+        let mut slot = self.probe.lock().unwrap_or_else(|e| e.into_inner());
+        let p = (*slot)?;
+        if now.duration_since(p.posted) > PROBE_TIMEOUT {
+            *slot = None;
+            return None;
+        }
+        if composed.is_some_and(|c| c < p.posted) {
+            return None;
+        }
+        slot.take()
+    }
 }
 
 pub fn spawn(target: Target, stream: Stream) -> Result<Pipeline> {
@@ -118,6 +158,9 @@ pub fn spawn(target: Target, stream: Stream) -> Result<Pipeline> {
         frames,
         keyframe: Arc::new(AtomicBool::new(true)),
         window: Arc::new(AtomicIsize::new(0)),
+        probe: Arc::new(Mutex::new(None)),
+        view: Arc::new(Mutex::new(None)),
+        placement: Arc::new(Mutex::new(None)),
         hook: Arc::new(Mutex::new(HookState { link: None, note: "输入隔离: 未启用".into() })),
     };
     let p = pipeline.clone();
@@ -129,6 +172,7 @@ pub fn spawn(target: Target, stream: Stream) -> Result<Pipeline> {
             }
             p.window.store(0, Ordering::Relaxed);
             p.detach_hook();
+            p.restore_window();
         })?;
     Ok(pipeline)
 }
@@ -161,6 +205,17 @@ fn run(p: &Pipeline, target: &Target, stream: Stream) -> Result<()> {
     }
     let (device, context) = create_nvidia_device()?;
     let api = nvenc::Api::load()?;
+    if let Some(n) = target.display {
+        // 对照实验:CYBER_REMOTE_DISPLAY_CAPTURE=window 时窗口照样铺满那块屏,但仍按窗口采集(WGC),
+        // 在同样大小下比较桌面复制和 WGC 的延迟。画面就是客户区,注入不用 view
+        if std::env::var("CYBER_REMOTE_DISPLAY_CAPTURE").as_deref() != Ok("window") {
+            return run_display(p, hwnd, n, &device, &context, &api, stream);
+        }
+        let (_, _, work) = display::find_output(&device, n)?;
+        let placement = display::place(hwnd, work)?;
+        *p.placement.lock().unwrap_or_else(|e| e.into_inner()) = Some(placement);
+        tracing::info!("窗口已铺满 \\\\.\\DISPLAY{n} 的工作区,按窗口采集(对照实验)");
+    }
 
     let winrt_device: IDirect3DDevice = unsafe {
         let dxgi: IDXGIDevice = device.cast()?;
@@ -197,13 +252,13 @@ fn run(p: &Pipeline, target: &Target, stream: Stream) -> Result<()> {
     }
 
     let mut out: Option<(ID3D11Texture2D, Encoder)> = None;
-    let start = Instant::now();
-    let mut last_encode = Instant::now();
-    let mut last_idr = Instant::now();
+    let mut tx = FrameSender::new();
     let mut logged_crop = None;
 
     loop {
         let woke = wake_rx.recv_timeout(Duration::from_millis(50));
+        // 这一帧认领到的延迟探针,以及它的合成、采集时刻
+        let mut frame_probe = None;
         if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             bail!("目标窗口已关闭");
         }
@@ -231,6 +286,9 @@ fn run(p: &Pipeline, target: &Target, stream: Stream) -> Result<()> {
             if unsafe { IsIconic(hwnd) }.as_bool() {
                 continue;
             }
+            let captured = Instant::now();
+            let composed = composed_at(&frame);
+            frame_probe = p.take_probe(composed, captured).map(|pp| (pp, composed, captured));
             let src: ID3D11Texture2D = unsafe {
                 frame
                     .Surface()?
@@ -288,30 +346,189 @@ fn run(p: &Pipeline, target: &Target, stream: Stream) -> Result<()> {
             };
             unsafe { context.CopySubresourceRegion(tex, 0, 0, 0, 0, &src, 0, Some(&bx)) };
             drop(frame);
-        } else if out.is_none() || last_encode.elapsed() < IDLE_REENCODE {
-            if !p.keyframe.load(Ordering::Relaxed) || out.is_none() {
-                continue;
-            }
+        } else if out.is_none() || tx.idle(p) {
+            continue;
         }
 
         let Some((_, enc)) = out.as_mut() else { continue };
+        tx.send(p, enc, frame_probe)?;
+    }
+}
+
+/// 整屏采集(`Target::display`,见 display.rs):窗口铺满那块屏,DXGI 桌面复制采整块屏
+fn run_display(
+    p: &Pipeline,
+    hwnd: HWND,
+    n: u32,
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    api: &nvenc::Api,
+    stream: Stream,
+) -> Result<()> {
+    // 窗口铺满工作区(不和任务栏抢),只采这块区域
+    let (output, screen, work) = display::find_output(device, n)?;
+    let placement = display::place(hwnd, work)?;
+    *p.placement.lock().unwrap_or_else(|e| e.into_inner()) = Some(placement);
+    *p.view.lock().unwrap_or_else(|e| e.into_inner()) = Some(work);
+    // 和按窗口采集一样,实例窗口不占任务栏,退出时 shutdown 还回去
+    if let Err(e) = taskbar(hwnd, false) {
+        tracing::warn!("从任务栏移除窗口失败: {e:#}");
+    }
+    let full = ((screen.right - screen.left) as u32, (screen.bottom - screen.top) as u32);
+    // H.264 4:2:0 要偶数宽高
+    let (w, h) = (((work.right - work.left) & !1) as u32, ((work.bottom - work.top) & !1) as u32);
+    let (x0, y0) = ((work.left - screen.left) as u32, (work.top - screen.top) as u32);
+    let mut dup = display::Duplication::new(output, device.clone())?;
+    let tex = create_texture(device, w, h)?;
+    let cfg = EncoderConfig { width: w, height: h, fps: stream.fps, bitrate: stream.bitrate };
+    let mut enc = Encoder::new(api, device, &tex, &cfg).context("创建 NVENC 编码器")?;
+    tracing::info!(
+        "整屏采集 \\\\.\\DISPLAY{n} {w}x{h},窗口已铺满这块屏的工作区;编码器 H.264 {}fps CBR {} kbps",
+        stream.fps,
+        stream.bitrate / 1000
+    );
+    p.request_keyframe();
+    let bx = D3D11_BOX { left: x0, top: y0, front: 0, right: x0 + w, bottom: y0 + h, back: 1 };
+    let mut tx = FrameSender::new();
+    // 第一帧到之前纹理是空的,不编码
+    let mut ready = false;
+    loop {
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            bail!("目标窗口已关闭");
+        }
+        let mut frame_probe = None;
+        match dup.acquire(50)? {
+            Some(frame) => {
+                let captured = Instant::now();
+                if frame.size() != full {
+                    let (fw, fh) = frame.size();
+                    bail!("这块屏的分辨率变了({}x{} → {fw}x{fh}),重启 agent", full.0, full.1);
+                }
+                frame_probe = p
+                    .take_probe(frame.presented, captured)
+                    .map(|pp| (pp, frame.presented, captured));
+                unsafe {
+                    context.CopySubresourceRegion(&tex, 0, 0, 0, 0, &frame.texture, 0, Some(&bx))
+                };
+                drop(frame);
+                dup.release();
+                ready = true;
+            }
+            None if !ready || tx.idle(p) => continue,
+            None => {}
+        }
+        tx.send(p, &mut enc, frame_probe)?;
+    }
+}
+
+/// 编码并广播一帧,两种采集方式共用:请求的关键帧、定期 IDR、延迟探针的时刻
+struct FrameSender {
+    start: Instant,
+    last_encode: Instant,
+    last_idr: Instant,
+}
+
+impl FrameSender {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self { start: now, last_encode: now, last_idr: now }
+    }
+
+    /// 没有新画面时可以跳过:离上次编码不到 IDLE_REENCODE,也没人要关键帧
+    fn idle(&self, p: &Pipeline) -> bool {
+        self.last_encode.elapsed() < IDLE_REENCODE && !p.keyframe.load(Ordering::Relaxed)
+    }
+
+    fn send(
+        &mut self,
+        p: &Pipeline,
+        enc: &mut Encoder,
+        probe: Option<(PendingProbe, Option<Instant>, Instant)>,
+    ) -> Result<()> {
         let mut idr = p.keyframe.swap(false, Ordering::Relaxed);
-        if last_idr.elapsed() >= PERIODIC_IDR {
+        if self.last_idr.elapsed() >= PERIODIC_IDR {
             idr = true;
         }
         let now = Instant::now();
-        let data = enc.encode(idr, now.duration_since(start).as_micros() as u64)?;
-        last_encode = now;
+        let data = enc.encode(idr, now.duration_since(self.start).as_micros() as u64)?;
+        let encoded = Instant::now();
+        let probe = probe.map(|(pp, composed, captured)| ProbeTiming {
+            id: pp.id,
+            received: pp.received,
+            posted: pp.posted,
+            composed,
+            captured,
+            encoded,
+        });
+        self.last_encode = now;
         if idr {
-            last_idr = now;
+            self.last_idr = now;
         }
         // 没有观众时 send 返回 Err,忽略即可
-        let _ = p.frames.send(EncodedFrame {
-            data: Bytes::from(data),
-            captured_at: now,
-        });
+        let _ = p.frames.send(EncodedFrame { data: Bytes::from(data), captured_at: now, probe });
+        Ok(())
     }
 }
+
+/// 一个窗口的 WGC 会话。合成时每个参与窗口各一个
+struct Source {
+    hwnd: HWND,
+    pool: Direct3D11CaptureFramePool,
+    session: windows::Graphics::Capture::GraphicsCaptureSession,
+    size: SizeInt32,
+    /// 本次轮询取到的最新一帧,下次轮询时丢弃
+    latest: Option<ID3D11Texture2D>,
+}
+
+impl Source {
+    fn new(device: &IDirect3DDevice, interop: &IGraphicsCaptureItemInterop, hwnd: HWND) -> Result<Self> {
+        let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
+        let size = item.Size()?;
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            size,
+        )?;
+        let session = pool.CreateCaptureSession(&item)?;
+        session.SetIsCursorCaptureEnabled(false)?;
+        session.StartCapture()?;
+        Ok(Self { hwnd, pool, session, size, latest: None })
+    }
+
+    /// 取最新一帧,丢掉积压的旧帧。尺寸变化时重建帧池,这一残缺帧丢弃
+    fn poll(&mut self, device: &IDirect3DDevice) -> Result<()> {
+        let mut last = None;
+        while let Ok(frame) = self.pool.TryGetNextFrame() {
+            let content = frame.ContentSize()?;
+            if content != self.size {
+                self.size = content;
+                self.pool.Recreate(
+                    device,
+                    DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                    2,
+                    self.size,
+                )?;
+                self.latest = None;
+                return Ok(());
+            }
+            let tex: ID3D11Texture2D = unsafe {
+                frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?.GetInterface()?
+            };
+            last = Some(tex);
+        }
+        if last.is_some() {
+            self.latest = last;
+        }
+        Ok(())
+    }
+
+    fn stop(&self) {
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
+    }
+}
+
 /// 客户区在采集纹理里的位置(像素,右/下开区间)
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Crop {
@@ -355,49 +572,32 @@ fn client_crop(hwnd: HWND, content: SizeInt32) -> Result<Option<Crop>> {
     }
 }
 
-/// 推流目标:要启动的程序,以及怎么认出它的窗口
-#[derive(Clone, Debug, Default)]
-pub struct Target {
-    /// 找不到窗口时启动的程序;不填就只找已打开的窗口
-    pub exe: Option<PathBuf>,
-    pub args: Vec<String>,
-    /// 窗口类名,精确匹配
-    pub class: Option<String>,
-    /// 窗口标题,包含即可
-    pub title: Option<String>,
-    /// 总是新开一个进程,不复用已打开的窗口(多开用)
-    pub fresh: bool,
-    /// 给目标进程装输入隔离钩子
-    pub hook: bool,
-    /// 只认这个进程的窗口。`fresh` 启动后由 agent 填
-    pub pid: Option<u32>,
+/// 帧的合成时刻。`SystemRelativeTime` 是 QPC 时间(100ns 为单位),按当前 QPC 换算成 `Instant`;
+/// 读不到或差值不合理(负数或超过 1 秒)时返回 None
+fn composed_at(frame: &Direct3D11CaptureFrame) -> Option<Instant> {
+    let rendered = frame.SystemRelativeTime().ok()?.Duration;
+    let (mut qpc, mut freq) = (0i64, 0i64);
+    unsafe {
+        QueryPerformanceCounter(&mut qpc).ok()?;
+        QueryPerformanceFrequency(&mut freq).ok()?;
+    }
+    let now = Instant::now();
+    let now_100ns = (i128::from(qpc) * 10_000_000 / i128::from(freq.max(1))) as i64;
+    let age = now_100ns - rendered;
+    if !(0..10_000_000).contains(&age) {
+        return None;
+    }
+    now.checked_sub(Duration::from_nanos(age as u64 * 100))
 }
 
-impl Target {
-    /// 内置档案 notepad、gametest
-    pub fn preset(name: &str) -> Result<Self> {
-        Ok(match name {
-            "notepad" => Self {
-                exe: Some("notepad.exe".into()),
-                class: Some("Notepad".into()),
-                ..Default::default()
-            },
-            // gametest 和 agent 在同一个 target 目录下
-            "gametest" => {
-                let exe = std::env::current_exe()?.with_file_name("gametest.exe");
-                if !exe.exists() {
-                    bail!("找不到 {},先 cargo build -p gametest", exe.display());
-                }
-                Self {
-                    exe: Some(exe),
-                    class: Some("CyberRemoteGameTest".into()),
-                    ..Default::default()
-                }
-            }
-            _ => bail!("未知的 --app {name},可选 notepad、gametest"),
-        })
-    }
+/// 按 `Target` 认窗口。`pid` 有值时只认这个进程的窗口(`fresh` 新启动的进程)
+#[derive(Clone, Copy)]
+struct Matcher<'a> {
+    target: &'a Target,
+    pid: Option<u32>,
+}
 
+impl Matcher<'_> {
     /// 填了类名或标题就只按它们认窗口(启动器拉起别的 exe 时也能找到);
     /// 都没填就认 exe 自己进程的窗口
     fn matches(&self, hwnd: HWND) -> bool {
@@ -413,17 +613,17 @@ impl Target {
             if owner != pid {
                 return false;
             }
-        } else if self.class.is_none() && self.title.is_none() {
-            return self.exe.as_ref().is_some_and(|exe| window_exe_is(hwnd, exe));
+        } else if self.target.class.is_none() && self.target.title.is_none() {
+            return self.target.exe.as_ref().is_some_and(|exe| window_exe_is(hwnd, exe));
         }
-        if let Some(class) = &self.class {
+        if let Some(class) = &self.target.class {
             let mut buf = [0u16; 256];
             let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
             if String::from_utf16_lossy(&buf[..n]) != *class {
                 return false;
             }
         }
-        if let Some(title) = &self.title {
+        if let Some(title) = &self.target.title {
             let mut buf = [0u16; 512];
             let n = unsafe { GetWindowTextW(hwnd, &mut buf) } as usize;
             if !String::from_utf16_lossy(&buf[..n]).contains(title.as_str()) {
@@ -435,14 +635,14 @@ impl Target {
 
     fn find(&self) -> Option<HWND> {
         unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
-            let (target, found) = unsafe { &mut *(lparam.0 as *mut (&Target, Option<HWND>)) };
-            if target.matches(hwnd) {
+            let (matcher, found) = unsafe { &mut *(lparam.0 as *mut (&Matcher, Option<HWND>)) };
+            if matcher.matches(hwnd) {
                 *found = Some(hwnd);
                 return false.into(); // 停止枚举
             }
             true.into()
         }
-        let mut state: (&Target, Option<HWND>) = (self, None);
+        let mut state: (&Matcher, Option<HWND>) = (self, None);
         // 回调返回 false 时 EnumWindows 也会报错,结果只看 state
         let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut state as *mut _ as isize)) };
         state.1
@@ -480,7 +680,7 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn find_or_launch(target: &Target) -> Result<HWND> {
     if !target.fresh
-        && let Some(h) = target.find()
+        && let Some(h) = (Matcher { target, pid: None }).find()
     {
         tracing::info!("找到已打开的窗口");
         // 最小化的窗口 WGC 只给标题栏大小的帧,先还原
@@ -499,7 +699,7 @@ fn find_or_launch(target: &Target) -> Result<HWND> {
     }
     let child = cmd.spawn().with_context(|| format!("启动 {}", exe.display()))?;
     // 多开时只认刚启动的这个进程的窗口,别抢到另一路已经在用的窗口
-    let scoped = Target { pid: target.fresh.then(|| child.id()), ..target.clone() };
+    let scoped = Matcher { target, pid: target.fresh.then(|| child.id()) };
     let deadline = Instant::now() + LAUNCH_TIMEOUT;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));

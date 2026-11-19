@@ -1,16 +1,17 @@
 //! cyber_remote 主机进程。
 //!
-//! 采集一个应用窗口 → NVENC H.264 → WebRTC 推给浏览器。
+//! 推一路应用画面给浏览器。找到或启动应用、采集编码、注入输入由平台后端(`platform`)做;
+//! 这里和 `session` 只管 HTTP、信令和 WebRTC,不直接调平台 API。
 //! HTTP 提供网页 `/`、健康检查 `/health` 和信令 `/ws`。
 
-mod capture;
-mod hooklink;
-mod inject;
+mod host;
 mod keyframe;
-mod nvenc;
+mod platform;
+mod playout;
 mod session;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::extract::State;
@@ -19,10 +20,11 @@ use axum::response::Response;
 use axum::{Router, routing::get};
 use tracing::info;
 
-use capture::Pipeline;
+use host::Host;
 
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 const INPUT_JS: &str = include_str!("../../../web/input.js");
+const LATENCY_JS: &str = include_str!("../../../web/latency.js");
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,26 +35,19 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // 让窗口坐标和 WGC 帧都用物理像素,裁剪才对得上
-    unsafe {
-        use windows::Win32::UI::HiDpi::{
-            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-        };
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
+    platform::init();
     let args = Args::parse()?;
+    session::set_playout_delay(args.playout_delay);
     info!("推流目标 {:?},{:?}", args.target, args.stream);
-    let pipeline = capture::spawn(args.target, args.stream)?;
+    let host = platform::spawn(args.target, args.stream)?;
 
     let app = Router::new()
         .route("/", get(|| async { axum::response::Html(INDEX_HTML) }))
-        .route(
-            "/input.js",
-            get(|| async { ([(axum::http::header::CONTENT_TYPE, "text/javascript; charset=utf-8")], INPUT_JS) }),
-        )
+        .route("/input.js", get(|| async { js(INPUT_JS) }))
+        .route("/latency.js", get(|| async { js(LATENCY_JS) }))
         .route("/health", get(|| async { "ok" }))
         .route("/ws", get(ws_handler))
-        .with_state(pipeline.clone());
+        .with_state(Arc::clone(&host));
 
     // 只在本机监听;局域网测试时再改成 0.0.0.0 并加认证
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
@@ -67,11 +62,7 @@ async fn main() -> Result<()> {
             }
         })
         .await?;
-    // 先撤钩子:目标进程里的钩子立刻回落到真实输入,再恢复任务栏按钮
-    pipeline.detach_hook();
-    if let Some(hwnd) = pipeline.window() {
-        capture::restore_taskbar(hwnd);
-    }
+    host.shutdown();
     Ok(())
 }
 
@@ -86,26 +77,29 @@ async fn wait_stdin_closed() {
     .await;
 }
 
-const USAGE: &str = "用法: agent [--app notepad|gametest] [--exe 程序] [--class 类名] [--title 标题] \
-[--fps 60] [--bitrate-kbps 20000] [--port 8080] [--new] [--hook] [--exit-on-stdin-close] \
+const USAGE: &str = "用法: agent [--app notepad|gametest] [--exe 程序] [--class 类名] [--title 标题] [--display N] \
+[--fps 60] [--bitrate-kbps 20000] [--port 8080] [--new] [--hook] [--exit-on-stdin-close] [--no-playout-delay] \
 [-- 程序参数...]";
 
 struct Args {
-    target: capture::Target,
-    stream: capture::Stream,
+    target: host::Target,
+    stream: host::Stream,
     port: u16,
     exit_on_stdin_close: bool,
+    /// 视频包带 playout-delay(min = max = 0)
+    playout_delay: bool,
 }
 impl Args {
     /// 什么都不给时推记事本。`--app` 先套档案,后面的 `--exe` 等再覆盖
     fn parse() -> Result<Self> {
         let mut it = std::env::args().skip(1);
-        let mut target: Option<capture::Target> = None;
-        let mut stream = capture::Stream { fps: 60, bitrate: 20_000_000 };
+        let mut target: Option<host::Target> = None;
+        let mut stream = host::Stream { fps: 60, bitrate: 20_000_000 };
         let mut port = 8080;
         let mut exit_on_stdin_close = false;
-        // --app 会整个换掉 target,所以这两个开关先记着,解析完再套上去
-        let (mut fresh, mut hook) = (false, false);
+        let mut playout_delay = true;
+        // --app 会整个换掉 target,所以这几个选项先记着,解析完再套上去
+        let (mut fresh, mut hook, mut display) = (false, false, None);
         while let Some(a) = it.next() {
             if a == "--" {
                 target.get_or_insert_with(Default::default).args = it.by_ref().collect();
@@ -124,15 +118,20 @@ impl Args {
                     hook = true;
                     continue;
                 }
+                "--no-playout-delay" => {
+                    playout_delay = false;
+                    continue;
+                }
                 _ => {}
             }
             let v = it.next().ok_or_else(|| anyhow::anyhow!("{a} 后面缺值\n{USAGE}"))?;
             let t = target.get_or_insert_with(Default::default);
             match a.as_str() {
-                "--app" => target = Some(capture::Target::preset(&v)?),
+                "--app" => target = Some(platform::preset(&v)?),
                 "--exe" => t.exe = Some(v.into()),
                 "--class" => t.class = Some(v),
                 "--title" => t.title = Some(v),
+                "--display" => display = Some(v.parse().context("--display")?),
                 "--fps" => stream.fps = v.parse().context("--fps")?,
                 "--bitrate-kbps" => stream.bitrate = v.parse::<u32>().context("--bitrate-kbps")? * 1000,
                 "--port" => port = v.parse().context("--port")?,
@@ -147,17 +146,22 @@ impl Args {
         }
         let mut target = match target {
             Some(t) => t,
-            None => capture::Target::preset("notepad")?,
+            None => platform::preset("notepad")?,
         };
         target.fresh = fresh;
         target.hook = hook;
+        target.display = display;
         if target.exe.is_none() && target.class.is_none() && target.title.is_none() {
             anyhow::bail!("至少给出 --exe、--class、--title 之一\n{USAGE}");
         }
-        Ok(Self { target, stream, port, exit_on_stdin_close })
+        Ok(Self { target, stream, port, exit_on_stdin_close, playout_delay })
     }
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(pipeline): State<Pipeline>) -> Response {
-    ws.on_upgrade(move |socket| session::handle_ws(socket, pipeline))
+async fn ws_handler(ws: WebSocketUpgrade, State(host): State<Arc<dyn Host>>) -> Response {
+    ws.on_upgrade(move |socket| session::handle_ws(socket, host))
+}
+
+fn js(body: &'static str) -> impl axum::response::IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, "text/javascript; charset=utf-8")], body)
 }

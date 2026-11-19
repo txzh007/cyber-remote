@@ -10,8 +10,16 @@ use std::time::{Duration, Instant};
 
 use protocol::{Input, MouseButton};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{ClientToScreen, GetUpdateRect, InvalidateRect, MapWindowPoints};
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, GetUpdateRect, InvalidateRect, MapWindowPoints, ScreenToClient,
+};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_RIGHT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GUI_INMENUMODE, GetMenu, GetMenuStringW, GetParent, HTCLIENT, HTMENU, MF_BYPOSITION,
+    MenuItemFromPoint, SC_KEYMENU, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_NCHITTEST,
+    WM_SYSCOMMAND, WindowFromPoint,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyboardState, MAPVK_VK_TO_VSC, MapVirtualKeyW,
     SetKeyboardState,
@@ -30,8 +38,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use hook_abi::{RAW_KIND_KEYBOARD, RAW_KIND_MOUSE, RawEvent};
 
-use crate::capture::Pipeline;
-use crate::hooklink::base_snapshot;
+use super::capture::{PendingProbe, Pipeline};
+use super::hooklink::base_snapshot;
+use super::keymap;
+use crate::host::InputEvent;
 
 // MK_* 在 SystemServices 里,为几个常量不值得多开一个 feature
 const MK_LBUTTON: usize = 0x0001;
@@ -56,8 +66,8 @@ const EXTENDED_KEYS: &[&str] = &[
 ];
 
 /// 每个浏览器会话一个输入线程,事件按到达顺序处理。发送端全部丢弃后线程松开所有按键并退出。
-pub fn spawn(pipeline: Pipeline) -> std::io::Result<mpsc::Sender<Input>> {
-    let (tx, rx) = mpsc::channel::<Input>();
+pub fn spawn(pipeline: Pipeline) -> std::io::Result<mpsc::Sender<InputEvent>> {
+    let (tx, rx) = mpsc::channel::<InputEvent>();
     std::thread::Builder::new()
         .name("input".into())
         .spawn(move || {
@@ -78,6 +88,11 @@ struct Injector {
     buttons: HashSet<MouseButton>,
     /// 按住鼠标期间,移动和抬起都发给按下时的窗口(模拟鼠标捕获)
     pressed_in: Option<HWND>,
+    /// 按下时落在非客户区(菜单栏、滚动条)的命中测试结果:抬起也按非客户区发,坐标是屏幕坐标。
+    /// 按客户区坐标发的话,菜单循环会把它当成屏幕坐标,以为在菜单外松开,把菜单关掉
+    pressed_hit: Option<u32>,
+    /// 这次左键按在菜单栏上、已改用键盘打开菜单:按下、抬起和左键状态都不给目标,见 mouse_button
+    swallow_left: bool,
     last_seq: Option<u32>,
     last_pos: (f32, f32),
     /// 上一次鼠标移动的客户区位置,相邻两次的差就是伪造的 Raw Input 相对位移
@@ -100,6 +115,8 @@ impl Injector {
             keys: HashMap::new(),
             buttons: HashSet::new(),
             pressed_in: None,
+            pressed_hit: None,
+            swallow_left: false,
             last_seq: None,
             last_pos: (0.5, 0.5),
             raw_prev: None,
@@ -146,7 +163,8 @@ impl Injector {
             .unwrap_or(top)
     }
 
-    fn handle(&mut self, ev: Input) {
+    fn handle(&mut self, ev: InputEvent) {
+        let InputEvent { at, input: ev } = ev;
         if ev == Input::ReleaseAll {
             self.release_all();
             return;
@@ -162,9 +180,16 @@ impl Injector {
                 self.last_seq = Some(seq);
                 self.mouse_move(top, x, y, dx, dy, rel);
             }
-            Input::MouseButton { button, down, x, y } => self.mouse_button(top, button, down, x, y),
+            Input::MouseButton { button, down, x, y, probe } => {
+                self.mouse_button(top, button, down, x, y, probe.map(|id| (id, at)));
+            }
             Input::Wheel { dx, dy, x, y } => self.wheel(top, dx, dy, x, y),
-            Input::Key { code, vk, down, repeat } => self.key(top, &code, vk, down, repeat),
+            Input::Key { code, vk, down, repeat } => {
+                // 以 code(物理键位)为准,认不出的键才用浏览器给的 vk
+                if let Some(vk) = keymap::resolve(&code, vk) {
+                    self.key(top, &code, vk, down, repeat);
+                }
+            }
             Input::Text { text } => self.text(top, &text),
             Input::ReleaseAll => unreachable!(),
         }
@@ -180,7 +205,7 @@ impl Injector {
         // 有虚拟光标(Pointer Lock)时以它为准,否则按归一化位置换算
         let client = self.virtual_pt.unwrap_or_else(|| {
             let (x, y) = self.last_pos;
-            client_point(top, x, y)
+            client_point(top, self.pipeline.view(), x, y)
         });
         self.pipeline.with_hook(|link| {
             let mut cursor = client;
@@ -252,7 +277,7 @@ impl Injector {
             });
             POINT { x: base.x.saturating_add(dx), y: base.y.saturating_add(dy) }
         } else {
-            client_point(top, x, y)
+            client_point(top, self.pipeline.view(), x, y)
         };
         if rel {
             self.virtual_pt = Some(cur);
@@ -269,22 +294,48 @@ impl Injector {
                 self.raw_mouse(mdx, mdy, 0, 0);
             }
         }
-        let (target, pt) = self.mouse_target_at(top, cur);
-        post(target, WM_MOUSEMOVE, self.mk_flags(), point_lparam(pt));
+        let aim = match self.pipeline.view() {
+            Some(_) => self.aim_screen(top, client_to_screen(top, cur)),
+            None => {
+                let (hwnd, pt) = self.mouse_target_at(top, cur);
+                Aim { hwnd, pt, hit: None }
+            }
+        };
+        aim.post(WM_MOUSEMOVE, self.mk_flags());
     }
 
-    fn mouse_button(&mut self, top: HWND, button: MouseButton, down: bool, x: f32, y: f32) {
+    /// `probe` 是延迟探针(编号, 收到时刻):消息一投递就登记,采集线程拿到的下一帧来认领
+    fn mouse_button(
+        &mut self,
+        top: HWND,
+        button: MouseButton,
+        down: bool,
+        x: f32,
+        y: f32,
+        probe: Option<(u32, Instant)>,
+    ) {
         self.last_pos = (x, y);
         if down == self.buttons.contains(&button) {
             return; // 重复的按下/抬起,忽略
         }
-        let (target, pt) = self.mouse_target(top, x, y);
+        let aim = self.aim(top, x, y);
+        let (target, pt) = (aim.hwnd, aim.pt);
+        // 菜单栏:后台窗口点菜单栏进不了菜单,改走键盘那条路,见 open_menu_bar。这次点击的按下、
+        // 抬起和左键状态都不给目标:菜单循环看到左键按下又松开、光标(真实的)不在菜单上,会把刚
+        // 展开的菜单收起来(实测)
+        let left = button == MouseButton::Left;
+        if down && left {
+            self.swallow_left = aim.hit == Some(HTMENU) && open_menu_bar(aim.hwnd, aim.pt);
+        }
+        let swallow = left && self.swallow_left;
         if down {
             self.buttons.insert(button);
         } else {
             self.buttons.remove(&button);
         }
-        self.attachment.set_key_state(target, &[(button_vk(button), down)]);
+        if !swallow {
+            self.attachment.set_key_state(target, &[(button_vk(button), down)]);
+        }
         self.publish(top);
         self.raw_mouse(0, 0, raw_button_flag(button, down), 0);
 
@@ -302,18 +353,27 @@ impl Injector {
         } else {
             up_msg
         };
-        post(target, msg, self.mk_flags() | xbutton, point_lparam(pt));
+        if !swallow {
+            aim.post(msg, self.mk_flags() | xbutton);
+        }
+        if !down && left {
+            self.swallow_left = false;
+        }
+        if let Some((id, received)) = probe {
+            self.pipeline.set_probe(PendingProbe { id, received, posted: Instant::now() });
+        }
         sync(target); // 按钮状态同样不随消息排队
 
         // 按下时锁定目标窗口,全部松开后解除
         self.pressed_in = if self.buttons.is_empty() { None } else { Some(target) };
+        self.pressed_hit = if self.buttons.is_empty() { None } else { aim.hit };
     }
 
     fn wheel(&mut self, top: HWND, dx: i32, dy: i32, x: f32, y: f32) {
         self.last_pos = (x, y);
-        let (target, _) = self.mouse_target(top, x, y);
+        let target = self.aim(top, x, y).hwnd;
         // 滚轮消息的坐标是屏幕坐标
-        let mut screen = client_point(top, x, y);
+        let mut screen = client_point(top, self.pipeline.view(), x, y);
         unsafe {
             let _ = ClientToScreen(top, &mut screen);
         }
@@ -381,12 +441,12 @@ impl Injector {
         let Some(top) = self.window() else {
             self.keys.clear();
             self.buttons.clear();
-            self.pressed_in = None;
+            (self.pressed_in, self.pressed_hit, self.swallow_left) = (None, None, false);
             return;
         };
         let (x, y) = self.last_pos;
         for button in self.buttons.clone() {
-            self.mouse_button(top, button, false, x, y);
+            self.mouse_button(top, button, false, x, y, None);
         }
         let keys: Vec<(String, u16)> = self.keys.iter().map(|(c, v)| (c.clone(), *v)).collect();
         for (code, vk) in keys {
@@ -395,17 +455,75 @@ impl Injector {
         if !self.keys.is_empty() || !self.buttons.is_empty() {
             tracing::warn!("释放按键后仍有残留状态");
         }
-        self.pressed_in = None;
+        (self.pressed_in, self.pressed_hit, self.swallow_left) = (None, None, false);
         self.last_down = None;
         self.attachment.detach();
     }
 
-    /// 鼠标消息发给哪个窗口、用该窗口的客户区坐标
-    fn mouse_target(&self, top: HWND, x: f32, y: f32) -> (HWND, POINT) {
-        self.mouse_target_at(top, client_point(top, x, y))
+    /// 鼠标消息的去向。整屏采集时按屏幕坐标找窗口,见 `aim_screen`;否则在目标窗口树里找
+    fn aim(&self, top: HWND, x: f32, y: f32) -> Aim {
+        let view = self.pipeline.view();
+        let pt = client_point(top, view, x, y);
+        if view.is_some() {
+            return self.aim_screen(top, client_to_screen(top, pt));
+        }
+        let (hwnd, pt) = self.mouse_target_at(top, pt);
+        Aim { hwnd, pt, hit: None }
     }
 
-    /// 同上,但输入是顶层窗口客户区的像素坐标
+    /// 整屏采集时的去向,照着系统分发真实鼠标输入的规则:
+    /// 1. 菜单模式(菜单栏菜单、右键菜单开着):发给菜单的捕获窗口,坐标填屏幕坐标。
+    ///    系统这时也是这么填的,菜单循环按屏幕坐标找菜单项
+    /// 2. 有窗口捕获了鼠标(下拉列表展开、拖滚动条):发给它
+    /// 3. 按住鼠标期间:发给按下时的窗口
+    /// 4. 坐标下属于目标进程的窗口(弹出窗口、对话框、子控件);落在客户区外发 WM_NC* 消息
+    fn aim_screen(&self, top: HWND, pt: POINT) -> Aim {
+        let mut pid = 0u32;
+        let tid = unsafe { GetWindowThreadProcessId(top, Some(&raw mut pid)) };
+        let mut info = GUITHREADINFO {
+            cbSize: size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetGUIThreadInfo(tid, &mut info) }.is_ok() {
+            if info.flags.0 & GUI_INMENUMODE.0 != 0 {
+                let hwnd = [info.hwndCapture, info.hwndMenuOwner]
+                    .into_iter()
+                    .find(|h| !h.is_invalid())
+                    .unwrap_or(top);
+                tracing::debug!("鼠标去向: 菜单模式 {:?},屏幕坐标 ({}, {})", hwnd.0, pt.x, pt.y);
+                return Aim { hwnd, pt, hit: None };
+            }
+            if !info.hwndCapture.is_invalid() {
+                tracing::debug!("鼠标去向: 捕获窗口 {:?}", info.hwndCapture.0);
+                return Aim::client(info.hwndCapture, pt);
+            }
+        }
+        if let Some(h) = self.pressed_in.filter(|&h| is_window(h)) {
+            return match self.pressed_hit {
+                Some(hit) => Aim { hwnd: h, pt, hit: Some(hit) },
+                None => Aim::client(h, pt),
+            };
+        }
+        let under = unsafe { WindowFromPoint(pt) };
+        let mut hwnd = if !under.is_invalid() && process_of(under) == pid { under } else { top };
+        let mut hit = hit_test(hwnd, pt);
+        // HTTRANSPARENT(静态文本、分组框):系统会交给下面的父窗口
+        if hit == -1
+            && let Ok(parent) = unsafe { GetParent(hwnd) }
+        {
+            hwnd = parent;
+            hit = hit_test(hwnd, pt);
+        }
+        tracing::debug!("鼠标去向: 坐标下的窗口 {:?},命中 {hit},屏幕坐标 ({}, {})", hwnd.0, pt.x, pt.y);
+        // 没命中(0)、出错(-2)也按客户区发,交给程序自己处理
+        if hit <= HTCLIENT as isize {
+            Aim::client(hwnd, pt)
+        } else {
+            Aim { hwnd, pt, hit: Some(hit as u32) }
+        }
+    }
+
+    /// 按窗口采集时鼠标消息发给哪个窗口、用该窗口的客户区坐标。输入是顶层窗口客户区的像素坐标
     fn mouse_target_at(&self, top: HWND, pt: POINT) -> (HWND, POINT) {
         if let Some(h) = self.pressed_in.filter(|&h| is_window(h)) {
             return (h, map_point(top, h, pt));
@@ -487,12 +605,136 @@ fn sync(h: HWND) {
     }
 }
 
+/// 在菜单栏上按下左键。系统只在窗口真被激活时才从鼠标点击进菜单:实测后台窗口收到
+/// WM_NCLBUTTONDOWN(HTMENU) 不开菜单,键盘进菜单(SC_KEYMENU,也就是 Alt+访问键)却可以。
+/// 所以找出点中的是第几项,按它的访问键走键盘那条路;没有访问键就从第一项用右方向键挪过去
+/// 再展开。菜单开了以后点菜单项走菜单模式的路由。点在菜单栏空白处返回 false
+fn open_menu_bar(hwnd: HWND, pt: POINT) -> bool {
+    let menu = unsafe { GetMenu(hwnd) };
+    if menu.is_invalid() {
+        return false;
+    }
+    let index = unsafe { MenuItemFromPoint(Some(hwnd), menu, pt) };
+    if index < 0 {
+        return false;
+    }
+    let mut buf = [0u16; 128];
+    let n = unsafe { GetMenuStringW(menu, index as u32, Some(&mut buf), MF_BYPOSITION) };
+    let text = String::from_utf16_lossy(&buf[..n.clamp(0, buf.len() as i32) as usize]);
+    match access_key(&text) {
+        Some(key) => post(hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, key as u32 as isize),
+        None => {
+            post(hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0);
+            for _ in 0..index {
+                post_key(hwnd, VK_RIGHT.0);
+            }
+            post_key(hwnd, VK_DOWN.0);
+        }
+    }
+    tracing::debug!("菜单栏第 {index} 项「{text}」:改用键盘打开");
+    true
+}
+
+/// 菜单文字里 & 后面的字符是访问键("文件(&F)" → 'f');"&&" 是字面的 &
+fn access_key(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            match chars.next() {
+                Some('&') => {}
+                Some(k) => return Some(k.to_ascii_lowercase()),
+                None => return None,
+            }
+        }
+    }
+    None
+}
+
+/// 给菜单循环发一次按键(按下 + 抬起)
+fn post_key(hwnd: HWND, vk: u16) {
+    post(hwnd, WM_KEYDOWN, vk as usize, 1);
+    post(hwnd, WM_KEYUP, vk as usize, 0xC000_0001u32 as i32 as isize);
+}
+
+/// 一条鼠标消息的去向
+#[derive(Clone, Copy)]
+struct Aim {
+    hwnd: HWND,
+    /// 写进 lParam 的坐标。客户区消息是 `hwnd` 的客户区坐标;非客户区消息和菜单模式下是屏幕坐标
+    pt: POINT,
+    /// 落在非客户区(菜单栏、滚动条)时的命中测试结果,这时发 WM_NC* 消息
+    hit: Option<u32>,
+}
+
+impl Aim {
+    /// 客户区消息:屏幕坐标换成 `hwnd` 的客户区坐标
+    fn client(hwnd: HWND, mut pt: POINT) -> Self {
+        unsafe {
+            let _ = ScreenToClient(hwnd, &mut pt);
+        }
+        Self { hwnd, pt, hit: None }
+    }
+
+    /// 投递鼠标消息。非客户区换成对应的 WM_NC* 消息(编号正好差 0x160),wParam 低 16 位
+    /// 换成命中测试结果,高 16 位(X 键编号)保留。滚轮没有 NC 版本,不走这里
+    fn post(&self, msg: u32, wparam: usize) {
+        match self.hit {
+            Some(hit) => {
+                post(self.hwnd, msg - 0x160, (wparam & !0xFFFF) | hit as usize, point_lparam(self.pt))
+            }
+            None => post(self.hwnd, msg, wparam, point_lparam(self.pt)),
+        }
+    }
+}
+
+fn client_to_screen(h: HWND, mut pt: POINT) -> POINT {
+    unsafe {
+        let _ = ClientToScreen(h, &mut pt);
+    }
+    pt
+}
+
+fn process_of(h: HWND) -> u32 {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(h, Some(&raw mut pid)) };
+    pid
+}
+
+/// 问窗口这个屏幕坐标落在哪(WM_NCHITTEST)。目标卡住或出错时按客户区算
+fn hit_test(h: HWND, pt: POINT) -> isize {
+    let mut result = 0usize;
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            h,
+            WM_NCHITTEST,
+            WPARAM(0),
+            LPARAM(point_lparam(pt)),
+            SMTO_ABORTIFHUNG,
+            50,
+            Some(&raw mut result),
+        )
+    };
+    if ok.0 == 0 { HTCLIENT as isize } else { result as isize }
+}
+
 fn point_lparam(pt: POINT) -> isize {
     (((pt.y as i16 as u16 as u32) << 16) | (pt.x as i16 as u16 as u32)) as i32 as isize
 }
 
-/// 归一化坐标 → 顶层窗口客户区坐标。画面就是客户区(宽高最多差 1 像素的取偶)
-fn client_point(top: HWND, x: f32, y: f32) -> POINT {
+/// 归一化坐标 → 顶层窗口客户区坐标。按窗口采集时画面就是客户区(宽高最多差 1 像素的取偶);
+/// 整屏采集时画面是 `view` 这块屏,先换成屏幕坐标再转到客户区,点在菜单栏上时 y 是负数
+fn client_point(top: HWND, view: Option<RECT>, x: f32, y: f32) -> POINT {
+    if let Some(v) = view {
+        let (w, h) = (v.right - v.left, v.bottom - v.top);
+        let mut pt = POINT {
+            x: v.left + ((x.clamp(0.0, 1.0) * w as f32) as i32).min(w - 1),
+            y: v.top + ((y.clamp(0.0, 1.0) * h as f32) as i32).min(h - 1),
+        };
+        unsafe {
+            let _ = ScreenToClient(top, &mut pt);
+        }
+        return pt;
+    }
     let mut rc = RECT::default();
     unsafe {
         let _ = GetClientRect(top, &mut rc);
@@ -659,4 +901,17 @@ fn key_lparam(code: &str, vk: u16, down: bool, repeat: bool) -> isize {
         l |= 1 << 30;
     }
     l as i32 as isize
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::access_key;
+
+    #[test]
+    fn menu_access_key() {
+        assert_eq!(access_key("文件(&F)"), Some('f'));
+        assert_eq!(access_key("&&Save &As"), Some('a'));
+        assert_eq!(access_key("A && B"), None);
+        assert_eq!(access_key("帮助"), None);
+    }
 }

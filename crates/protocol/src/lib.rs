@@ -32,6 +32,32 @@ impl Signal {
 pub const CHANNEL_INPUT_FAST: &str = "input-fast";
 /// 按键、鼠标按钮、滚轮、文本走的 DataChannel:可靠、有序
 pub const CHANNEL_INPUT_KEY: &str = "input-key";
+/// agent 发给浏览器的消息走的 DataChannel:可靠、有序。浏览器创建,但不往里发
+pub const CHANNEL_CONTROL: &str = "control";
+
+/// agent 经 [`CHANNEL_CONTROL`] 发给浏览器的消息
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Control {
+    /// 延迟探针在 agent 内各环节的时刻,Unix 毫秒(带小数),和浏览器的
+    /// `performance.timeOrigin + performance.now()` 是同一条时间轴,同一台机器上可以直接相减。
+    /// `composed`(系统合成出这一帧)拿不到时为 null
+    Probe {
+        id: u32,
+        received: f64,
+        posted: f64,
+        composed: Option<f64>,
+        captured: f64,
+        encoded: f64,
+        sent: f64,
+    },
+}
+
+impl Control {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("Control 序列化不会失败")
+    }
+}
 
 /// 浏览器发给 agent 的输入事件。
 ///
@@ -44,11 +70,27 @@ pub enum Input {
     /// 此时 `x`/`y` 是虚拟光标当前所在的归一化位置,只用于按下等消息。
     /// 为假(没有 Pointer Lock)时按绝对位置移动,字段 `x`/`y` 有效
     MouseMove { seq: u32, x: f32, y: f32, #[serde(default)] dx: i32, #[serde(default)] dy: i32, #[serde(default)] rel: bool },
-    MouseButton { button: MouseButton, down: bool, x: f32, y: f32 },
+    /// `probe` 只在延迟测量(PLAN 0.8)时带:agent 把这次点击之后第一帧在主机内各环节的
+    /// 时刻经 [`CHANNEL_CONTROL`] 回报,见 [`Control::Probe`]
+    MouseButton {
+        button: MouseButton,
+        down: bool,
+        x: f32,
+        y: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        probe: Option<u32>,
+    },
     /// 滚动量用 Windows 的单位:一格 = 120,`dy` 为正表示向上滚
     Wheel { dx: i32, dy: i32, x: f32, y: f32 },
-    /// 不可打印的键和组合键。`code` 是 DOM `KeyboardEvent.code`,`vk` 是 Windows 虚拟键码
-    Key { code: String, vk: u16, down: bool, repeat: bool },
+    /// 按键。`code` 是 DOM `KeyboardEvent.code`(物理键位),各平台后端以它为准换算成本地键码;
+    /// `vk` 是浏览器给的 Windows 虚拟键码(`keyCode`),只作提示,`code` 认不出时才用
+    Key {
+        code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vk: Option<u16>,
+        down: bool,
+        repeat: bool,
+    },
     /// 可打印字符与输入法上屏的文字
     Text { text: String },
     /// 浏览器失焦或断线前:松开所有按键和鼠标按钮
@@ -96,12 +138,37 @@ mod tests {
             .unwrap();
         assert_eq!(
             ev,
-            Input::MouseButton { button: MouseButton::Left, down: true, x: 0.5, y: 0.25 }
+            Input::MouseButton { button: MouseButton::Left, down: true, x: 0.5, y: 0.25, probe: None }
         );
         let ev = Input::from_json(r#"{"type":"key","code":"KeyA","vk":65,"down":false,"repeat":false}"#)
             .unwrap();
-        assert!(matches!(ev, Input::Key { vk: 65, down: false, .. }));
+        assert!(matches!(ev, Input::Key { vk: Some(65), down: false, .. }));
+        // vk 可以不带,以 code 为准
+        let ev = Input::from_json(r#"{"type":"key","code":"KeyA","down":true,"repeat":false}"#).unwrap();
+        assert!(matches!(ev, Input::Key { vk: None, down: true, .. }));
         assert_eq!(Input::from_json(r#"{"type":"release_all"}"#).unwrap(), Input::ReleaseAll);
+    }
+
+    #[test]
+    fn latency_probe_json() {
+        let ev = Input::from_json(
+            r#"{"type":"mouse_button","button":"left","down":true,"x":0.5,"y":0.5,"probe":7}"#,
+        )
+        .unwrap();
+        assert!(matches!(ev, Input::MouseButton { probe: Some(7), .. }));
+        let msg = Control::Probe {
+            id: 7,
+            received: 1.5,
+            posted: 2.0,
+            composed: None,
+            captured: 3.0,
+            encoded: 4.0,
+            sent: 5.0,
+        };
+        assert_eq!(
+            msg.to_json(),
+            r#"{"type":"probe","id":7,"received":1.5,"posted":2.0,"composed":null,"captured":3.0,"encoded":4.0,"sent":5.0}"#
+        );
     }
 
     #[test]

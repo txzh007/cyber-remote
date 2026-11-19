@@ -18,6 +18,7 @@
 <textarea id="ime" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
 <div id="hud">连接中…</div>
 <script src="/input.js"></script>
+<script src="/latency.js"></script>
 <script>
 const video = document.getElementById('video');
 const hud = document.getElementById('hud');
@@ -76,8 +77,11 @@ async function start() {
   // 数据通道要在 createOffer 之前建,offer 里才有 SCTP 段
   const fast = pc.createDataChannel('input-fast', { ordered: false, maxRetransmits: 0 });
   const key = pc.createDataChannel('input-key');
+  // agent 发来的消息(目前只有延迟探针的回报),转成 agent-control 事件
+  const control = pc.createDataChannel('control');
+  control.onmessage = e => dispatchEvent(new CustomEvent('agent-control', { detail: JSON.parse(e.data) }));
   // 给自动化测试直接发消息用(见 scripts/e2e.mjs 的相对位移阶段)
-  window.__channels = { fast, key, seq: 0 };
+  window.__channels = { fast, key, control, seq: 0 };
   attachInput(video, document.getElementById('ime'), fast, key, { pointerLock: gameMode });
   pc.ontrack = e => {
     // 低延迟优先:不攒抖动缓冲
@@ -124,6 +128,15 @@ async function start() {
 }
 
 start().catch(e => { status = '错误: ' + e; hud.textContent = status; });
+
+// 延迟测量模式(PLAN 0.8):打开 /?latency=200,配合 gametest --latency。
+// 结果显示在 HUD,也放在 window.__latencyResult 给 scripts/latency.mjs 读
+const latencyRuns = new URLSearchParams(location.search).get('latency');
+if (latencyRuns !== null) {
+  runLatencyTest({ video, count: Number(latencyRuns) || 200, onStatus: t => { info = t; } })
+    .then(r => { window.__latencyResult = r; info = formatLatency(r); })
+    .catch(e => { window.__latencyError = String(e); info = '延迟测量失败: ' + e; });
+}
 </script>
 </body>
 </html>
