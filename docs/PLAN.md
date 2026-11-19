@@ -1,6 +1,6 @@
 # cyber_remote Windows 计划与技术选型
 
-> 状态:草案,2026-10-28。首发平台为 Windows,macOS/Linux 后续按 `SessionBackend` 接口扩展。
+> 状态:草案,2026-10-28 起草,2026-11-19 更新。首发平台为 Windows;要做跨平台,各平台按 `platform/` 下的后端接口扩展(见 4.1)。
 
 ## 1. 目标
 
@@ -99,10 +99,30 @@ trait Session {
 }
 ```
 
-Windows 先实现 `Win32WindowSession`。Linux(每路一个无头 Wayland 合成器)和 macOS 以后各自实现这两个 trait。
+2026-11-19 定:做跨平台。一路 = 一个隔离的"座位":一块虚拟屏 + 一路虚拟输入 + 一个音频出口。Linux 每路一个无头 Wayland 合成器(参考 Wolf),Windows 计划改成每路一块 IDD 虚拟屏 + 现有 hook(待 spike),macOS 隔离最弱,多开大概率要靠虚拟机。
 
-### 4.2 目录结构(计划)
+代码里的落地比上面的草图简单:`crates/agent/src/host.rs` 放平台无关的类型和 `Host` trait(订阅编码帧、请求关键帧、开输入通道、状态提示、退出清理);`platform/` 下每个平台提供 `init`、`preset`、`spawn`,目前只有 `platform/windows`(采集、NVENC、注入、hook 连接都在里面),其他平台编译时走 `unsupported`,运行时报错。编码器暂时跟着平台走,等第二个平台出现再抽公共部分。协议里按键以 DOM `code` 为准,`vk` 只作提示。
 
+近期顺序(2026-11-19):0.8 延迟基线 → 抽平台边界(这两项已完成)→ Windows 虚拟屏 spike → Linux 后端原型。
+
+### 4.2 目录结构
+
+```
+cyber_remote/
+├── Cargo.toml          # workspace
+├── docs/PLAN.md
+├── crates/
+│   ├── agent/          # 主机进程
+│   │   └── src/
+│   │       ├── main.rs、session.rs、keyframe.rs、playout.rs  # HTTP、信令、WebRTC(平台无关)
+│   │       ├── host.rs                            # 核心类型与 Host trait
+│   │       └── platform/windows/                  # 采集(按窗口 / 整屏)、NVENC、注入、hook 连接
+│   ├── protocol/       # 信令与 DataChannel 消息类型(serde)
+│   ├── hook/、hook-abi/ # 注入目标进程的 DLL,以及它和 agent 共用的共享内存布局
+│   ├── gametest/       # 输入测试窗口;--latency 是延迟测量用的黑白窗口
+│   └── launcher/       # egui 启动器
+├── scripts/            # e2e.mjs、latency.mjs、start-multi.ps1
+└── web/                # 浏览器客户端(原生 JS)
 ```
 cyber_remote/
 ├── Cargo.toml          # workspace
@@ -127,7 +147,13 @@ cyber_remote/
 - [x] 0.5 webrtc-rs 建连,视频轨发送编码帧;自定义拦截器(`keyframe.rs`)把 PLI/FIR 交给应用触发 IDR,每 20 秒一次 IDR 兜底
 - [x] 0.6 agent 内嵌 WebSocket 信令和静态页服务
 - [x] 0.7 浏览器收流,`jitterBufferTarget = 0`,HUD 显示码率、帧率、丢包(2026-10-28 Chromium 实测:60fps,丢包 0)
-- [ ] 0.8 延迟测试应用:点击让色块变白,浏览器检测白块,统计 p50/p95
+- [x] 0.8 延迟测试应用:点击让色块变白,浏览器检测白块,统计 p50/p95(2026-11-19 在本机测过,局域网还没测)
+  - 做法:`gametest --latency` 整窗黑色,左键按下变白;页面 `/?latency=N`(`web/latency.js`)用 `requestVideoFrameCallback` 逐帧看画面中心;agent 给带探针编号的点击记下收到、投递、出帧、编码、发送的时刻,经 `control` 通道回报,页面拆成各段。一键跑:`cargo build --release -p agent -p gametest` 后 `node scripts/latency.mjs`,结果存在 `target/latency/`
+  - 基线(release、Edge 有头、同一台机器、60Hz 屏、100 次):总计 p50 92 ms、p95 210 ms。主机内部很快:浏览器→agent 0.3、应用重画到采集 9.6、编码 2.1、打包 0.1(都是 p50)。时间几乎都花在浏览器侧:缓冲+等显示 p50 60 ms(分成 25–30 和 90 两档);网络→收齐 p50 0.8 但 p90 51 ms,本机回环不该这样,后来查明不是网络问题(见下);解码 p90 28 ms
+  - 2026-11-19 发送端给视频包带上 playout-delay 扩展(min = max = 0,`playout.rs`;`--no-playout-delay` 关掉做对照):总计 p50 45.5 ms、p95 95 ms,同一批关掉的对照组是 134 / 237;缓冲+等显示 p50 27 ms,抖动缓冲平均 0.2 ms,丢包、NACK、丢帧都是 0。测量结果里加了这些入站统计。代价是浏览器不再攒缓冲平滑抖动,Wi-Fi 这类抖动大的网络上可能卡顿,上局域网后要再测
+  - 网络段的长尾是探针挂错了帧:三次测量里网络段超过 10 ms 的样本,"应用重画+合成"中位数只有 2 ms(其余样本 10 ms),两段之和约 20 ms(其余约 11 ms)。应用在 vsync 前一刻才画完时,紧接着那次合成还是旧画面,探针挂在了这一帧上,白帧晚一次合成(16.7 ms)才出来,这段时间被算进了网络。总计不受影响。后来查明这是 WGC 的毛病,窗口大时一半以上的点击都这样,桌面复制少得多(见第 8 节)。要拆准,得让 agent 回报探针帧的 RTP 时间戳,浏览器用 rVFC 的 `rtpTimestamp` 对上是哪一帧(还没做)
+  - 剩下的大头:缓冲+等显示 27 ms 基本是浏览器的合成管线(解码完到上屏 1–2 个 vsync),再往下要换 WebCodecs + canvas;应用重画+合成约 10 ms 是在等 DWM 合成,虚拟屏开到高刷新率能降。前几次点击偶尔有 130–150 ms 的网络段,原因没查
+  - 没取到系统合成时刻:WGC 帧的 `SystemRelativeTime` 换算后都落在接受范围外(可能是下一次 vblank 的时刻,待查),所以"合成→采集"并在"应用重画+合成"里
 
 退出条件:Chrome 中看到记事本内容区,无标题栏;局域网测出 p50/p95 数字。
 
@@ -135,7 +161,7 @@ cyber_remote/
 
 目标:浏览器能操作记事本和 `gametest`,主机本地鼠标不受影响。
 
-- [x] 1.1 数据通道与 `protocol` 消息定义(先做了 `input-fast`、`input-key`;`control` 等 1.4 再加;按键状态快照未做)
+- [x] 1.1 数据通道与 `protocol` 消息定义(先做了 `input-fast`、`input-key`;`control` 通道 2026-11-19 随 0.8 加上,目前只回报延迟探针;按键状态快照未做)
 - [x] 1.2 鼠标:`WM_MOUSEMOVE`、按键、滚轮,坐标从内容区换算到客户区(2026-10-28 实测:点击定位、拖选、双击选词、滚轮)
 - [x] 1.3 键盘:`WM_KEYDOWN/UP`(扫描码 + 虚拟键)、`WM_CHAR`,IME 文本走 `WM_CHAR`(实测:中英文、回车、退格、Ctrl+A、Shift+Home)
   - 输入线程要一直 `AttachThreadInput` 挂在目标线程上,解除挂接时写进去的 Ctrl 状态会丢
@@ -143,6 +169,7 @@ cyber_remote/
 - [ ] 1.4 `WM_SETCURSOR`、`WM_NCHITTEST`,光标形状回传客户端
 - [x] 1.5 焦点伪装:`WM_ACTIVATE`、`WM_SETFOCUS`、`WM_ACTIVATEAPP`(会话第一次输入时补发一次;窗口本来就在前台则不补。端到端测过 `gametest` 收到这三条。已知限制:只是补发消息,窗口并不真的获得系统焦点,`GetFocus()` 之类的 API 仍返回旧值)
 - [ ] 1.6 弹出窗口:枚举同进程顶层窗口(菜单、tooltip、对话框),合成进画面并按坐标路由输入
+  - 2026-11-19 暂停:逐窗口合成只有 Windows 需要,而且 19045 上 WGC 多半不接受菜单、tooltip 这类 tool window。等"每路一块虚拟屏"的 spike(第 8 节),那条路上弹出窗口天然在画面里。`platform/windows/compositor.rs` 和 `capture.rs` 里的 `Source` 是这项的半成品
 - [x] 1.7 断线时释放所有按键与按钮(实测:按住 Ctrl 刷新页面,重连后打字正常)
 - [ ] 1.8 音频:WASAPI 整机环回 → Opus → 音频轨
 - [x] 1.9 `gametest` 测试程序;agent 用 `--app` 选择推流目标(2026-10-28 实测:窗口消息和 `GetKeyState` 收到注入的键鼠、Shift 组合字符和回车;`GetAsyncKeyState`、Raw Input、XInput 没有反应,符合预期;主机光标不动)
@@ -207,6 +234,12 @@ cyber_remote/
 | 注入 DLL 依赖 VC++ 运行库 | hook DLL 动态链接 `VCRUNTIME140.dll` 和 UCRT(2026-11-05 dumpbin 实测,x86 和 x64 相同)。目标机缺对应位宽的运行库时 `LoadLibraryW` 失败,该实例不受隔离 | 发布前改成静态 CRT(`+crt-static`,要写进 `.cargo/config.toml`,会影响整个 workspace 的构建);DLL 装好后给 agent 回执,超时就拒绝该实例 |
 | 窗口最小化 | WGC 采集不到最小化窗口 | 阻止最小化,或将窗口移到屏幕外 |
 | 消费级显卡 NVENC 并发上限 | 限制同时编码的路数 | 实测;多路时考虑混合编码后端 |
+| 多开时声音串流 | 整机环回下每一路都听到所有实例;19045 不能按进程环回 | Win11/Server 2022 起用按进程环回;19045 上给每个实例一个虚拟音频设备 + 按应用指定输出设备,或在 hook DLL 里截 WASAPI |
+| 开发机 Win10 已过支持期 | 消费版延长更新 2026-10-13 结束;黄框、不能按进程环回、WGC 拒绝 tool window 都是旧系统的限制 | 生产基线待定(第 8 节) |
+| 没有拥塞控制 | 固定 CBR,带宽一掉延迟暴涨,丢包后只能整帧 IDR | 接 webrtc-rs 0.21 自带的 GCC(`configure_congestion_control`),目标码率交给 `nvEncReconfigureEncoder` |
+| 浏览器端缓冲 | 0.8 实测"缓冲+等显示"p50 60 ms,是总延迟的大头;`jitterBufferTarget = 0` 只是目标,不是上限 | 已加 playout-delay 扩展(min=max=0),降到 p50 27 ms;再往下要换 WebCodecs + canvas,绕开 video 元素的合成管线 |
+| 局域网要 HTTPS | 非 localhost 的 http 页面不是安全上下文,Gamepad、Keyboard Lock、剪贴板、WebCodecs 都用不了 | 上局域网前配好 HTTPS |
+| 实例之间没有安全边界 | 同一用户同一会话,实例能互相读内存、投消息;共享内存用默认权限,名字也猜得到 | 只跑运营方挑选的应用;要跑用户自带程序得用虚拟机或 Linux 容器 |
 
 ## 7. 开发环境
 
@@ -226,4 +259,14 @@ cyber_remote/
 - [x] 产品定位:单机/独立游戏和模拟器云化,兼顾普通桌面应用;不含带反作弊的网游
 - [ ] 是否闭源商用
 - [ ] 首发浏览器范围(`Keyboard.lock` 只有 Chrome 系支持)
+- [x] 跨平台:做(2026-11-19)。一路 = 一个座位:虚拟屏 + 虚拟输入 + 音频出口
+- [ ] Windows 是否改成每路一块虚拟屏、采集整屏。开发机上向日葵、GameViewer 的虚拟显卡只能由它们自己的客户端开关,没有公开接口,不考虑。分两步:
+  - [x] 第一步(2026-11-19):不装驱动,拿实体副屏代替虚拟屏。`--display N`:目标窗口去掉边框、置顶、铺满 `\\.\DISPLAYn` 的工作区(不盖任务栏),DXGI 桌面复制只采这块区域(`platform/windows/display.rs`),退出时还原窗口。结果:右键菜单这类弹出窗口在画面里;本机屏幕上没有黄框;每帧有合成时刻(合成→采集 0.1 ms)。置顶是必须的:后台进程用 `HWND_TOP` 抬不起别的进程的窗口,实测被副屏上原有的窗口挡住,采到的是别的窗口
+  - 延迟(2560×1392,各 100 次):桌面复制总计 p50 48.6 / p95 67.5 / 最大 96 ms;同样铺满但按窗口采集(`CYBER_REMOTE_DISPLAY_CAPTURE=window`,对照用)是 55.5 / 79.9 / 196。按窗口采集的拆分里"网络"p50 就有 16 ms:WGC 点击后先交一帧旧画面,新画面晚一次合成才到,0.8 里网络段的长尾也是这个原因;桌面复制交的就是新画面。和小窗口按窗口采集(45.5 / 95)比,p50 高 3 ms 主要是画面大了 4 倍,编码从 2 ms 涨到 5 ms
+  - 整屏模式的鼠标路由(2026-11-19,`inject.rs` 的 `aim_screen`):照着系统分发真实鼠标输入的规则来。菜单模式下发给菜单的捕获窗口,坐标填屏幕坐标(菜单循环按屏幕坐标找菜单项);有窗口捕获了鼠标(下拉列表、拖滚动条)就发给它;否则发给坐标下属于目标进程的窗口,落在非客户区发 `WM_NC*`。实测在画面里点右键菜单项、点菜单栏、点菜单栏下拉里的项都能用,弹出的对话框也在画面里。按窗口采集的路由没动
+  - 菜单栏是绕过去的:后台窗口收到 `WM_NCLBUTTONDOWN(HTMENU)` 不开菜单(多半要求窗口真被激活,或真实鼠标键按着),键盘进菜单(`SC_KEYMENU`,即 Alt+访问键)却可以。所以点菜单栏时用 `MenuItemFromPoint` 找出点中的项,按它的访问键走键盘那条路(没有访问键就用方向键挪过去);这次点击的按下、抬起和左键状态都不给目标,否则菜单循环看到左键松开、真实光标不在菜单上,会把刚展开的菜单收起来
+  - 还没做:屏上别的置顶窗口和系统通知也会被采进去;分辨率变了要重启 agent
+  - 已修(2026-11-19):会话一开始没点过就直接打字会丢字符,按窗口采集也一样。焦点伪装补发的激活消息只是投进队列,程序还没在 WM_SETFOCUS 里把焦点交给子控件,紧跟着的文字查不到焦点窗口,发给了顶层窗口。现在补发后用 `sync` 等它处理完(最多 100 ms,每个会话一次)
+  - [ ] 第二步:装可编程的虚拟屏驱动(首选 SudoVDA,Apollo 用它给每个连接建屏;备选 parsec-vdd),验证高刷新率、每个实例按需建屏和断开就删。做成了 1.6 的逐窗口合成就作废
+- [ ] Windows 生产基线:Win11 24H2+/Server 2022+,还是继续 19045(改成虚拟屏后基本只影响音频)
 
