@@ -7,6 +7,7 @@
 #![windows_subsystem = "windows"]
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -15,7 +16,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DeleteDC, DeleteObject,
     EndPaint, FW_NORMAL, FillRect, FrameRect, HDC, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS,
     PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
-    TextOutW,
+    TextOutW, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetKeyNameTextW, GetKeyState};
@@ -32,7 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, RegisterClassW, SetTimer,
     SetWindowTextW, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_INPUT,
     WM_KEYDOWN, WM_KILLFOCUS, WM_MOUSEFIRST, WM_MOUSELAST, WM_MOUSEWHEEL, WM_PAINT, WM_SETFOCUS,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -127,10 +129,12 @@ fn main() -> Result<()> {
         // 和 agent 一样用物理像素,裁剪和坐标换算才对得上
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+        // --latency:延迟测量用的黑白窗口(见 latency_wndproc)
+        let latency = std::env::args().any(|a| a == "--latency");
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(wndproc),
+            lpfnWndProc: Some(if latency { latency_wndproc } else { wndproc }),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             lpszClassName: CLASS_NAME,
@@ -145,7 +149,7 @@ fn main() -> Result<()> {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS_NAME,
-            w!("gametest"),
+            if latency { w!("gametest latency") } else { w!("gametest") },
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -181,8 +185,11 @@ fn main() -> Result<()> {
             RAWINPUTDEVICE { usUsagePage: 1, usUsage: 2, dwFlags: RIDEV_INPUTSINK, hwndTarget: hwnd },
             RAWINPUTDEVICE { usUsagePage: 1, usUsage: 6, dwFlags: RIDEV_INPUTSINK, hwndTarget: hwnd },
         ];
-        RegisterRawInputDevices(&devices, size_of::<RAWINPUTDEVICE>() as u32)?;
-        SetTimer(Some(hwnd), TIMER_ID, TICK_MS, None);
+        // 延迟模式不轮询也不重画:画面只在点击时变,采集到的新帧就是点击的结果
+        if !latency {
+            RegisterRawInputDevices(&devices, size_of::<RAWINPUTDEVICE>() as u32)?;
+            SetTimer(Some(hwnd), TIMER_ID, TICK_MS, None);
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -599,4 +606,43 @@ fn yes(b: bool) -> &'static str {
 
 fn or_dash(s: &str) -> &str {
     if s.is_empty() { "-" } else { s }
+}
+
+/// `--latency` 模式的当前颜色:左键按着时是白色
+static WHITE: AtomicBool = AtomicBool::new(false);
+
+/// `--latency` 模式:整窗黑色,左键按下立刻涂白,抬起涂黑。PLAN 0.8 的延迟测量
+/// (web/latency.js)在浏览器里看画面中心什么时候变白
+unsafe extern "system" fn latency_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_LBUTTONDOWN | WM_LBUTTONUP => {
+            WHITE.store(msg == WM_LBUTTONDOWN, Ordering::Relaxed);
+            // 立刻重画,不等消息队列空下来
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                let _ = UpdateWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            unsafe {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let v = if WHITE.load(Ordering::Relaxed) { 255 } else { 0 };
+                let brush = CreateSolidBrush(rgb(v, v, v));
+                FillRect(hdc, &rc, brush);
+                let _ = DeleteObject(brush.into());
+                let _ = EndPaint(hwnd, &ps);
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
 }
