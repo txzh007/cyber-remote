@@ -1,12 +1,13 @@
-//! 打开 agent 创建的共享内存,只读映射进本进程。
+//! 打开 agent 创建的共享内存,读写映射进本进程。
 //!
-//! hook 只读不写:快照走 seqlock,Raw Input 走环形缓冲(见 `hook-abi`)。
+//! 输入相关的字段 hook 只读不写:快照走 seqlock,Raw Input 走环形缓冲(见 `hook-abi`)。
+//! 映射要可写只是因为声音环 `Shared::audio` 是 hook 写、agent 读,除它之外一个字节也不许写。
 
 use std::sync::OnceLock;
 
 use hook_abi::{ABI_VERSION, FLAG_ACTIVE, Shared, Snapshot, mapping_name};
 use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile, OpenFileMappingW};
+use windows::Win32::System::Memory::{FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, OpenFileMappingW};
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::core::HSTRING;
 
@@ -17,10 +18,11 @@ static SHARED: OnceLock<&'static Shared> = OnceLock::new();
 pub fn open() -> Result<(), String> {
     let name = HSTRING::from(mapping_name(unsafe { GetCurrentProcessId() }));
     unsafe {
-        let handle = OpenFileMappingW(FILE_MAP_READ.0, false, &name)
+        let access = FILE_MAP_READ | FILE_MAP_WRITE;
+        let handle = OpenFileMappingW(access.0, false, &name)
             .map_err(|e| format!("打开共享内存 {name} 失败: {e}"))?;
         // 按 Shared 的完整大小映射;映射比它小就直接失败,不会读越界
-        let view = MapViewOfFile(handle, FILE_MAP_READ, 0, 0, size_of::<Shared>());
+        let view = MapViewOfFile(handle, access, 0, 0, size_of::<Shared>());
         // 视图自己撑着底层对象,句柄用完就关
         let _ = CloseHandle(handle);
         if view.Value.is_null() {

@@ -46,11 +46,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, Interface, PWSTR};
 
+use super::audio::AudioThread;
 use super::compositor::{self, Canvas, Layer};
 use super::display;
 use super::hooklink::{self, HookLink};
 use super::nvenc::{self, Encoder, EncoderConfig};
-use crate::host::{EncodedFrame, ProbeTiming, Stream, Target};
+use crate::host::{AudioFrame, EncodedFrame, ProbeTiming, Stream, Target};
 
 /// 内容不变时 WGC 不出帧;隔这么久重编一次,让新加入的观众也能拿到画面
 const IDLE_REENCODE: Duration = Duration::from_millis(500);
@@ -73,6 +74,8 @@ pub struct PendingProbe {
 #[derive(Clone)]
 pub struct Pipeline {
     pub frames: broadcast::Sender<EncodedFrame>,
+    /// 声音帧。只有开了 `--hook` 且没设 `CYBER_REMOTE_AUDIO=off` 才有
+    pub audio: Option<broadcast::Sender<AudioFrame>>,
     keyframe: Arc<AtomicBool>,
     /// 正在采集的窗口句柄,0 表示还没找到或已关闭。HWND 不是 Send,这里存数值
     window: Arc<AtomicIsize>,
@@ -88,6 +91,8 @@ pub struct Pipeline {
 struct HookState {
     link: Option<HookLink>,
     note: String,
+    /// 声音线程,依附在 hook 连接上:它停了,目标的声音就回到主机扬声器
+    audio: Option<AudioThread>,
 }
 
 impl Pipeline {
@@ -103,8 +108,17 @@ impl Pipeline {
         }
     }
 
-    /// 撤掉输入隔离,目标进程里的钩子回落到真实输入
+    /// 停声音线程。可以反复调用;join 在锁外做,免得卡住别的线程
+    pub fn stop_audio(&self) {
+        let audio = self.hook.lock().unwrap_or_else(|e| e.into_inner()).audio.take();
+        if let Some(mut a) = audio {
+            a.stop();
+        }
+    }
+
+    /// 撤掉输入隔离,目标进程里的钩子回落到真实输入。声音线程先停,映射才能安心释放
     pub fn detach_hook(&self) {
+        self.stop_audio();
         let mut h = self.hook.lock().unwrap_or_else(|e| e.into_inner());
         if h.link.take().is_some() {
             h.note = "输入隔离: 已撤销".into();
@@ -154,14 +168,18 @@ impl Pipeline {
 
 pub fn spawn(target: Target, stream: Stream) -> Result<Pipeline> {
     let (frames, _) = broadcast::channel(8);
+    // CYBER_REMOTE_AUDIO=off 是 A/B 对照用的开关(比如量声音对延迟的影响),不写进 USAGE
+    let audio = (target.hook && std::env::var("CYBER_REMOTE_AUDIO").as_deref() != Ok("off"))
+        .then(|| broadcast::channel(64).0);
     let pipeline = Pipeline {
         frames,
+        audio,
         keyframe: Arc::new(AtomicBool::new(true)),
         window: Arc::new(AtomicIsize::new(0)),
         probe: Arc::new(Mutex::new(None)),
         view: Arc::new(Mutex::new(None)),
         placement: Arc::new(Mutex::new(None)),
-        hook: Arc::new(Mutex::new(HookState { link: None, note: "输入隔离: 未启用".into() })),
+        hook: Arc::new(Mutex::new(HookState { link: None, note: "输入隔离: 未启用".into(), audio: None })),
     };
     let p = pipeline.clone();
     std::thread::Builder::new()
@@ -186,6 +204,13 @@ fn attach_hook(p: &Pipeline, hwnd: HWND) {
     match result {
         Ok(link) => {
             tracing::info!("输入隔离已启用");
+            // 声音依附在 hook 上:线程开始心跳,hook 才会截目标进程的声音
+            if let Some(tx) = &p.audio {
+                match AudioThread::start(link.audio(), tx.clone()) {
+                    Ok(a) => h.audio = Some(a),
+                    Err(e) => tracing::warn!("声音未启用: {e:#}"),
+                }
+            }
             h.link = Some(link);
             h.note = "输入隔离: 已启用".into();
         }

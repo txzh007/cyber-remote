@@ -18,12 +18,13 @@ use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
-use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MediaEngine};
+use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
     RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability, RtpCodecKind,
 };
+use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 use tracing::{info, warn};
@@ -36,9 +37,10 @@ use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
     RTCPeerConnectionState,
 };
+use webrtc::rtp_transceiver::RtpSender;
 use webrtc::runtime::{Receiver, Sender, channel};
 
-use crate::host::{Host, InputEvent, ProbeTiming, epoch_ms};
+use crate::host::{AudioFrame, Host, InputEvent, ProbeTiming, epoch_ms};
 use crate::{keyframe, playout};
 
 const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -193,6 +195,8 @@ async fn run(socket: &mut WebSocket, host: Arc<dyn Host>, offer: String) -> Resu
     };
     let mut media_engine = MediaEngine::default();
     media_engine.register_codec(codec.clone(), RtpCodecKind::Video)?;
+    media_engine.register_codec(opus_codec(), RtpCodecKind::Audio)?;
+    // playout-delay 只按视频注册:音频流协商出来的扩展表里没有它,PlayoutDelayInterceptor 不会碰音频包
     if PLAYOUT_DELAY.load(Ordering::Relaxed) {
         media_engine.register_header_extension(
             RTCRtpHeaderExtensionCapability { uri: playout::URI.to_owned() },
@@ -245,6 +249,66 @@ struct Events {
     done: Receiver<()>,
 }
 
+/// Opus:48 kHz 立体声,10 ms 一帧(见 audio.rs)。stereo=1 让浏览器按双声道解
+fn opus_codec() -> RTCRtpCodecParameters {
+    RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: 48000,
+            channels: 2,
+            sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1".to_owned(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: 111,
+        ..Default::default()
+    }
+}
+
+/// 协商出的音频轨的本地 SSRC 和 payload type
+async fn audio_params(track: &TrackLocalStaticSample, sender: &Arc<dyn RtpSender>) -> Result<(u32, u8)> {
+    let payload_type = sender
+        .get_parameters()
+        .await?
+        .rtp_parameters
+        .codecs
+        .first()
+        .map(|c| c.payload_type)
+        .ok_or_else(|| anyhow!("没有协商出音频编码"))?;
+    let ssrc = *track.ssrcs().await.first().ok_or(RtcError::ErrSenderWithNoSSRCs)?;
+    Ok((ssrc, payload_type))
+}
+
+/// 会话结束(正常或出错)时中止后台任务
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// 把音频帧逐帧写进音频轨。落后了(Lagged)丢掉旧的接着写,广播关了或轨道写不进去就结束
+async fn pump_audio(
+    track: Arc<TrackLocalStaticSample>,
+    ssrc: u32,
+    payload_type: u8,
+    mut frames: broadcast::Receiver<AudioFrame>,
+) {
+    loop {
+        match frames.recv().await {
+            Ok(f) => {
+                let sample = Sample { data: f.data, duration: f.duration, ..Sample::new(Instant::now()) };
+                if let Err(e) = track.sample_writer(ssrc, payload_type).write_sample(&sample).await {
+                    warn!("写音频轨失败,声音停止: {e}");
+                    return;
+                }
+            }
+            Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => return,
+        }
+    }
+}
+
 /// 协商并推流
 async fn stream(
     socket: &mut WebSocket,
@@ -275,6 +339,44 @@ async fn stream(
     )?);
     // 先加轨道再设远端描述,answer 里才会把浏览器的 recvonly 段配成 sendonly
     let sender = pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal>).await?;
+
+    // 声音轨,和视频轨在同一个位置加。stream id 必须和视频轨的不同:同一个 MediaStream 里的
+    // 音视频,Chrome 会做唇音同步,把视频的播放时刻压到和音频的抖动缓冲一样晚,
+    // playout-delay 和 jitterBufferTarget = 0 就白做了。声音是附带的,建不起来只记日志,不影响画面
+    let audio = if host.subscribe_audio().is_some() {
+        let added: Result<_> = async {
+            let audio_ssrc = RandomState::new().hash_one(Instant::now()) as u32;
+            let track = Arc::new(TrackLocalStaticSample::new(
+                Instant::now(),
+                MediaStreamTrack::new(
+                    "cyber-remote-audio".to_owned(),
+                    "audio".to_owned(),
+                    "audio".to_owned(),
+                    RtpCodecKind::Audio,
+                    vec![RTCRtpEncodingParameters {
+                        rtp_coding_parameters: RTCRtpCodingParameters {
+                            ssrc: Some(audio_ssrc),
+                            ..Default::default()
+                        },
+                        codec: opus_codec().rtp_codec,
+                        ..Default::default()
+                    }],
+                ),
+            )?);
+            let sender = pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal>).await?;
+            Ok((track, sender))
+        }
+        .await;
+        match added {
+            Ok(a) => Some(a),
+            Err(e) => {
+                warn!("声音轨没建起来,只推画面: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     pc.set_remote_description(RTCSessionDescription::offer(offer)?)
         .await
@@ -310,6 +412,21 @@ async fn stream(
         .ok_or_else(|| anyhow!("没有协商出视频编码"))?;
     let ssrc = *track.ssrcs().await.first().ok_or(RtcError::ErrSenderWithNoSSRCs)?;
     info!("开始推流 ssrc={ssrc} pt={payload_type}");
+
+    // 声音连上之后才订阅:握手这几秒攒下的旧帧不发,免得凭空多出几百毫秒延迟
+    let _audio_task = match &audio {
+        Some((track, sender)) => match audio_params(track, sender).await {
+            Ok((audio_ssrc, audio_pt)) => host.subscribe_audio().map(|rx| {
+                info!("开始推声音 ssrc={audio_ssrc} pt={audio_pt}");
+                AbortOnDrop(tokio::spawn(pump_audio(Arc::clone(track), audio_ssrc, audio_pt, rx)))
+            }),
+            Err(e) => {
+                warn!("声音没协商上,只推画面: {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
 
     let mut frames = host.subscribe();
     host.request_keyframe();

@@ -15,15 +15,18 @@
 </head>
 <body>
 <video id="video" autoplay playsinline muted></video>
+<audio id="audio" autoplay></audio>
 <textarea id="ime" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
 <div id="hud">连接中…</div>
 <script src="/input.js"></script>
 <script src="/latency.js"></script>
 <script>
 const video = document.getElementById('video');
+const audio = document.getElementById('audio');
 const hud = document.getElementById('hud');
 let status = '连接中…';
 let info = '';   // agent 发来的提示,比如输入隔离是否启用
+let audioBlocked = false;   // 浏览器的自动播放策略拦了声音,等用户点一下
 // 游戏模式:Pointer Lock 发相对位移,给靠无限转视角的游戏用。勾选后重新连一次才生效
 let gameMode = localStorage.getItem('gameMode') === '1';
 // HUD 右上角的开关,点它就能切;勾选框放进 HUD 会挡鼠标,所以用键盘快捷键 F2
@@ -58,6 +61,29 @@ addEventListener('resize', fitVideo);
 video.addEventListener('resize', fitVideo);
 video.addEventListener('loadedmetadata', fitVideo);
 
+// 没有用户操作之前浏览器不让有声音的媒体自动播放。第一次点击或按键时补一次 play();
+// 只监听、不 preventDefault,不影响 input.js 处理同一个事件
+function unlockAudio() {
+  if (audio.srcObject && audio.paused) audio.play().catch(() => {});
+}
+addEventListener('pointerdown', unlockAudio, { capture: true, passive: true });
+addEventListener('keydown', unlockAudio, { capture: true, passive: true });
+audio.addEventListener('playing', () => { audioBlocked = false; });
+
+// Chrome 的 offer 里 Opus 的 fmtp 不带 stereo=1,不加的话它按单声道解码,立体声被压成一路
+function stereoOpus(sdp) {
+  const m = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/);
+  if (!m) return sdp;
+  const pt = m[1];
+  const extra = 'stereo=1;sprop-stereo=1';
+  const fmtp = new RegExp(`^(a=fmtp:${pt} .*?)(\\r?)$`, 'm');
+  const found = sdp.match(fmtp);
+  if (found) {
+    return found[1].includes('stereo=1') ? sdp : sdp.replace(fmtp, (_, line, cr) => `${line};${extra}${cr}`);
+  }
+  return sdp.replace(m[0], `${m[0]}\r\na=fmtp:${pt} ${extra}`);
+}
+
 function waitGathering(pc) {
   if (pc.iceGatheringState === 'complete') return Promise.resolve();
   return new Promise(resolve => {
@@ -74,6 +100,7 @@ async function start() {
   const pc = new RTCPeerConnection({ iceServers: [] });
   window.pc = pc;
   pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
   // 数据通道要在 createOffer 之前建,offer 里才有 SCTP 段
   const fast = pc.createDataChannel('input-fast', { ordered: false, maxRetransmits: 0 });
   const key = pc.createDataChannel('input-key');
@@ -84,13 +111,22 @@ async function start() {
   window.__channels = { fast, key, control, seq: 0 };
   attachInput(video, document.getElementById('ime'), fast, key, { pointerLock: gameMode });
   pc.ontrack = e => {
+    if (e.track.kind === 'audio') {
+      // 声音也不攒抖动缓冲。音视频在 agent 那边是两个不同的 stream,浏览器才不会为了唇音同步拖慢视频
+      if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
+      audio.srcObject = e.streams[0] || new MediaStream([e.track]);
+      audio.play().catch(() => { audioBlocked = true; });
+      return;
+    }
     // 低延迟优先:不攒抖动缓冲
     if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
     video.srcObject = e.streams[0] || new MediaStream([e.track]);
   };
   pc.onconnectionstatechange = () => { status = pc.connectionState; };
 
-  await pc.setLocalDescription(await pc.createOffer());
+  const offer = await pc.createOffer();
+  offer.sdp = stereoOpus(offer.sdp);
+  await pc.setLocalDescription(offer);
   await waitGathering(pc);
 
   const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -122,6 +158,7 @@ async function start() {
       last = inbound;
     }
     line += `\n游戏模式: ${gameMode ? '开' : '关'}(F2 切换)`;
+    if (audioBlocked) line += '\n声音: 点一下画面开启';
     if (info) line += '\n' + info;
     hud.textContent = line;
   }, 1000);

@@ -8,9 +8,12 @@
 //! - 捕获:`SetCapture`、`GetCapture`
 //! - Raw Input:`GetRawInputData`、`GetRawInputBuffer`(配合 agent 伪造的 `WM_INPUT`)
 //! - 手柄:`XInputGetState`(只做手柄 0)
+//! - 声音:`IAudioClient::Initialize`、`IAudioClient3::InitializeSharedAudioStream`、`GetService`、
+//!   `IAudioRenderClient::GetBuffer`、`ReleaseBuffer`,截共享模式的输出(见 `detours/audio.rs`)
 //!
-//! 共享内存布局见 `hook-abi`。agent 是写方,这里是读方;DLL 在 `DllMain` 里起一个
-//! 线程,打开 `Local\cyber_remote_hook_{pid}`,校验通过后用 minhook 装上所有钩子。
+//! 共享内存布局见 `hook-abi`。输入这几项 agent 是写方,这里是读方;声音反过来,这里把截到的 PCM
+//! 写进环,agent 读。DLL 在 `DllMain` 里起一个线程,打开 `Local\cyber_remote_hook_{pid}`,
+//! 校验通过后用 minhook 装上所有钩子。
 //! 不支持带反作弊的游戏,也不做任何绕过。
 
 #![cfg(windows)]

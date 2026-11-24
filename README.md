@@ -16,6 +16,7 @@
 画面:目标程序 → 采集(WGC 按窗口 / DXGI 整屏)→ D3D11 → NVENC H.264 → WebRTC 视频轨 → 浏览器 <video>
 输入:浏览器键鼠 → DataChannel(input-fast 不可靠 / input-key 可靠)→ agent 注入线程 → 窗口消息 + 焦点伪装 → 目标程序
 隔离:agent 把每个实例的虚拟键鼠状态写进共享内存 → 目标进程里的 hook DLL 拦截输入 API,改读这份状态
+声音:目标程序 → hook 拦 WASAPI ReleaseBuffer,PCM 抄进共享内存环(主机静音)→ agent 混成 48 kHz 立体声 → Opus → WebRTC 音频轨 → 浏览器 <audio>
 回报:agent → control 通道 → 浏览器(延迟探针各环节的时刻)
 ```
 
@@ -26,7 +27,7 @@
 | `agent` | 主机进程:网页、WebSocket 信令、WebRTC 会话、各平台后端 |
 | `protocol` | 信令和 DataChannel 消息类型(serde),浏览器和 agent 的约定 |
 | `hook` / `hook-abi` | 注入目标进程的 DLL(minhook 拦截输入 API),以及它和 agent 共用的共享内存布局 |
-| `gametest` | 输入测试窗口;`--latency` 是延迟测量用的黑白窗口 |
+| `gametest` | 输入测试窗口;`--latency` 是延迟测量用的黑白窗口;`--tone HZ` 等 hook 装好再循环放一个单音(测声音),`--tone-now HZ` 一启动就放(造注入前建好的声音流) |
 | `launcher` | egui 启动器 |
 
 agent 内部分两层,平台无关的部分不碰任何系统 API:
@@ -44,6 +45,7 @@ agent 内部分两层,平台无关的部分不碰任何系统 API:
 - **编码**:直接调 NVENC(FFI),H.264 High,P4 + 超低延迟,CBR 20 Mbps,4 帧 VBV,无限 GOP;收到 PLI/FIR 或每 20 秒出一个 IDR;画面不动时每 500 ms 补编一帧
 - **输入**:`PostMessage` 投窗口消息,不动真实的键鼠。`AttachThreadInput` + `SetKeyboardState` 同步按键状态;按键后用"弄脏 1 像素、等 WM_PAINT 画掉"做屏障,保证状态和消息的顺序;会话第一次输入时补发激活消息(焦点伪装),让程序以为自己在前台;按键以 DOM `code` 为准
 - **输入隔离**(`--hook`):注入 hook DLL,拦截 `GetAsyncKeyState`、`GetKeyState`、`GetKeyboardState`、`GetCursorPos` / `SetCursorPos` / `ClipCursor`、`GetForegroundWindow` / `GetActiveWindow` / `GetFocus` / `GetCapture`、`GetRawInputData` / `GetRawInputBuffer`、`XInputGetState`,全部改读 agent 写在共享内存(seqlock 快照 + Raw Input 环形缓冲)里的本实例状态
+- **声音**(`--hook`):hook 截 WASAPI 输出(在 `ReleaseBuffer` 里把 PCM 抄进共享内存的环,再给原调用加静音标志),agent 每 10 ms 取一次,混成 48 kHz 立体声、Opus 编码后走 WebRTC 音频轨。按实例单独推流,agent 运行期间主机不放这个实例的声音;agent 退出或崩了,300 ms 内声音回到主机扬声器
 - **整屏模式的鼠标路由**照着系统分发真实输入的规则:菜单开着时按屏幕坐标发给菜单的捕获窗口;有窗口捕获了鼠标就发给它;否则发给坐标下属于目标进程的窗口,落在非客户区发 `WM_NC*`;点菜单栏改走键盘进菜单
 
 ### 跨平台:一路 = 一个"座位"
@@ -94,14 +96,18 @@ agent 内部分两层,平台无关的部分不碰任何系统 API:
 ### 5. 多开密度和部署
 
 - 消费级 GeForce 显卡的 NVENC 同时编码会话数有上限,驱动许可也不允许数据中心部署
-- Win10 19045 不能按进程环回声音,多开时每一路都会听到所有实例(Win11 / Server 2022 起可以)
+- 声音按实例分开靠 hook 截 WASAPI(Win10 19045 不能按进程环回,Win11 / Server 2022 起可以),所以要 `--hook`。独占模式、空间音频(ISpatialAudioClient)、声音放在子进程里的程序(Electron / CEF)截不到
+- 注入之前程序就建好的声音流,hook 没见过它的格式:
+  - 只能按系统混音格式去猜
+  - 数据明显不对(读不到、放不下、按 f32 看不像声音)就放弃这一路:远端听不到,主机照常放
+  - 采样率猜错检查不出来,会变调
 - 实例之间没有安全边界(同一用户、同一会话),只适合运营方挑选的应用;要跑用户自带的程序得用虚拟机或容器
 
 ### 6. 还没做的
 
 - 拥塞控制:现在固定 CBR,带宽一掉延迟就暴涨 → 接 webrtc-rs 的 GCC,目标码率交给 `nvEncReconfigureEncoder`
 - 局域网 HTTPS:非 localhost 的 http 页面不是安全上下文,Gamepad、Keyboard Lock、剪贴板、WebCodecs 都用不了
-- 声音、多实例管理界面
+- 多实例管理界面
 
 计划、实测数据和决策记录见 [docs/PLAN.md](docs/PLAN.md)。
 
@@ -122,7 +128,7 @@ target\release\agent.exe --app gametest --new --hook --port 8081    # 再开一�
 | `--app notepad\|gametest` | 内置档案 |
 | `--exe` / `--class` / `--title` | 自己指定目标:程序路径、窗口类名(精确)、标题(包含即可) |
 | `--new` | 总是新开一个进程(多开) |
-| `--hook` | 输入隔离 |
+| `--hook` | 输入隔离;声音推流也靠它 |
 | `--display N` | 整屏采集:窗口铺满 `\\.\DISPLAYn` 的工作区并采这块屏 |
 | `--fps 60` / `--bitrate-kbps 20000` | 帧率、码率 |
 | `--port 8080` | 网页端口,多开时每个实例一个 |
@@ -132,8 +138,8 @@ target\release\agent.exe --app gametest --new --hook --port 8081    # 再开一�
 ## 测试
 
 ```powershell
-cargo test -p protocol -p agent -p hook-abi
-node scripts/e2e.mjs                    # 两个 gametest 实例同时操作:输入隔离、焦点伪装、Pointer Lock
+cargo test -p protocol -p agent -p hook-abi -p hook
+node scripts/e2e.mjs                    # 两个 gametest 实例同时操作:输入隔离、焦点伪装、Pointer Lock、声音(两路各放 440 / 880 Hz,各听各的)
 node scripts/latency.mjs --count 100    # 本机延迟测量,结果存在 target/latency/
 node scripts/latency.mjs --display 2    # 整屏采集模式
 ```

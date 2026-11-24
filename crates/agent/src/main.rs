@@ -4,6 +4,9 @@
 //! 这里和 `session` 只管 HTTP、信令和 WebRTC,不直接调平台 API。
 //! HTTP 提供网页 `/`、健康检查 `/health` 和信令 `/ws`。
 
+// 只有 Windows 后端用它(hook 截声音),其他平台编译时不算死代码
+#[cfg_attr(not(windows), allow(dead_code))]
+mod audio;
 mod host;
 mod keyframe;
 mod platform;

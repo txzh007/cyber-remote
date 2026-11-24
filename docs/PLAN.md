@@ -32,7 +32,7 @@
 | 窗口采集 | 直接用 `windows` crate 调 Windows.Graphics.Capture | MIT/Apache-2.0 | 按窗口采集,输出 D3D11 纹理;不再引入 `windows-capture`,少一层封装,和 NVENC 共用同一个 D3D11 设备 |
 | 视频编码 | 方案 A:直接调 NVENC,自写薄 FFI | MIT 式(头文件) | 见 3.1 |
 | 软件编码兜底 | `openh264` 0.9 | BSD-2 | 无 GPU 或调试用 |
-| 音频 | WASAPI 环回(`windows` crate)+ Opus | — | 本机 19045 只能整机环回,见第 6 节 |
+| 音频 | hook 截 WASAPI 共享模式的输出(`windows` crate + `minhook`)+ Opus(`unsafe-libopus`) | — | 按实例分开推流,要 `--hook`;19045 不能按进程环回,所以不用环回,见 1.8 和第 6 节 |
 | API hook(P2) | `minhook` 0.9(已选,不用 `retour`) | MIT / BSD | hook DLL 需 x86 与 x64 两份 |
 | 异步运行时 | `tokio` | MIT | webrtc-rs 默认运行时 |
 | 信令 | WebSocket(`axum`) | MIT | Phase 0 内嵌在 agent 里 |
@@ -66,7 +66,7 @@ agent 内部流水线(每路会话一条):
 
 ```
 WGC 按窗口采集 → 裁剪标题栏/边框(GPU) → 编码 H.264 → webrtc-rs 视频轨
-WASAPI 环回    → Opus                  → webrtc-rs 音频轨
+hook 截 WASAPI → 共享内存环 → 混音 + Opus → webrtc-rs 音频轨(按实例,要 --hook)
 DataChannel 输入 → 坐标换算(内容区→窗口) → 窗口消息注入 [P2: + hook DLL 虚拟输入状态]
 ```
 
@@ -171,7 +171,12 @@ cyber_remote/
 - [ ] 1.6 弹出窗口:枚举同进程顶层窗口(菜单、tooltip、对话框),合成进画面并按坐标路由输入
   - 2026-11-19 暂停:逐窗口合成只有 Windows 需要,而且 19045 上 WGC 多半不接受菜单、tooltip 这类 tool window。等"每路一块虚拟屏"的 spike(第 8 节),那条路上弹出窗口天然在画面里。`platform/windows/compositor.rs` 和 `capture.rs` 里的 `Source` 是这项的半成品
 - [x] 1.7 断线时释放所有按键与按钮(实测:按住 Ctrl 刷新页面,重连后打字正常)
-- [ ] 1.8 音频:WASAPI 整机环回 → Opus → 音频轨
+- [x] 1.8 音频:hook 截 WASAPI 共享模式的输出 → 共享内存环 → agent 混音 → Opus → 音频轨(要 `--hook`;原计划的整机环回弃用:19045 不能按进程环回,多开时每一路会听到所有实例)
+  - 做法:hook 钩 `IAudioClient::Initialize`、`IAudioClient3::InitializeSharedAudioStream`、`GetService`、`IAudioRenderClient::GetBuffer` / `ReleaseBuffer`(COM 方法没有导出名,装之前先建一个临时共享模式流,从虚表取函数地址)。`ReleaseBuffer` 里把这次写的 PCM 抄进共享内存里的环(`Shared::audio`,1 MiB,hook 写 agent 读),再给原调用加 `AUDCLNT_BUFFERFLAGS_SILENT`,主机扬声器就不出这个实例的声音。agent 的声音线程每 10 ms 取一次:目标进程里每个输出流是一路,各自重采样、攒预缓冲、补偿时钟漂移,下混成立体声后相加,48 kHz 立体声 Opus 编码(10 ms 一帧)走 WebRTC 音频轨。声音线程的心跳就是 hook 的开关:agent 退出或崩了,心跳过期,300 ms 内声音回到主机扬声器
+  - 注入前建好的流:hook 在目标启动之后才注入,程序在这之前建好的输出流,hook 没见过它的 `Initialize`,只能按默认设备的混音格式(一般是 f32)去猜。猜错了会按错的每帧字节数读缓冲区,所以这样的流每个包抄之前都要验:数据指针在已提交的可读内存里(`VirtualQuery`,排除 NOACCESS 和 GUARD,区域按流缓存);猜的长度不超过所在区域(超了就是每帧字节数猜大了);样本按 f32 看不许有 NaN、Inf 和绝对值大于 16(16 位整数被当成 f32 读,几乎必然出现)。全零的静音骗得过检查,有声音时才露馅,所以每个包都查。验不过就放弃这一路:往环里写一个放弃包(`AUDIO_PACKET_ABANDONED`),agent 把这一路从混音器里移走并 warn 一条,hook 之后对这一路的 `ReleaseBuffer` 原样放行,远端听不到,主机照常放。混音格式不是 f32 时没法检查,这样的流不截。采样率猜错检查不出来,会变调
+  - 实测(本机 Win10 19045):`scripts/e2e.mjs` 两路各放 440 / 880 Hz,页面里的频谱峰值分别是 439.5 Hz 和 878.9 Hz,各听各的;`--tone` 那路流主机默认输出设备的峰值(`IAudioMeterInformation`)没有 agent 时是 0.2,agent 运行中是 0.0(被截走,主机静音),agent 退出后回到 0.2;视频延迟(`scripts/latency.mjs`)p50 带音频轨 36.4 ms,不带 35.9 ms
+  - 注入前建好的流的实测(2026-11-23):`agent --app gametest --new --hook -- --tone-now 440`,gametest 一启动就放 16 位的 440 Hz,输出流在注入之前建好。声音线程启动约 20 ms 后 agent 就 warn 放弃了这一路(第一个包按 f32 看不像声音,hook 也记了放弃的原因);主机输出峰值 0.2,没被静音;浏览器端 audioLevel 为 0(音频轨照常有包,内容是静音);agent 退出码 0,退出后 gametest 继续运行,主机峰值仍是 0.2,gametest 收到 WM_CLOSE 后自己正常退出,系统日志里没有崩溃记录
+  - 剩余限制:要 `--hook`;独占模式和空间音频(ISpatialAudioClient)截不到;在子进程里放声音的程序(Electron / CEF)截不到;注入前建好的流只能靠猜格式
 - [x] 1.9 `gametest` 测试程序;agent 用 `--app` 选择推流目标(2026-10-28 实测:窗口消息和 `GetKeyState` 收到注入的键鼠、Shift 组合字符和回车;`GetAsyncKeyState`、Raw Input、XInput 没有反应,符合预期;主机光标不动)
 - [ ] 1.10 浏览器游戏模式:全屏 + Pointer Lock(发相对位移)+ Keyboard Lock(Esc 等不被浏览器吃掉);手柄用 Gamepad API(Pointer Lock 的发送和 agent 侧已做完,见下面进度:页面按 F2 切换游戏模式,相对增量经 `rel` 字段发到 agent,虚拟光标按增量累加,不再受窗口消息回中影响;端到端只测了协议和 agent 这一段,真实 Pointer Lock 的手感要手动验。全屏、Keyboard Lock、Gamepad 还没做)
 
@@ -223,7 +228,7 @@ cyber_remote/
 
 | 项 | 影响 | 应对 |
 |---|---|---|
-| 本机 build 19045 < 20348 | 无法关闭 WGC 黄色采集边框;无法按进程环回音频 | 黄框只在主机屏幕上显示,不进采集画面(2026-10-28 浏览器截图已确认);音频先用整机环回 |
+| 本机 build 19045 < 20348 | 无法关闭 WGC 黄色采集边框;无法按进程环回音频 | 黄框只在主机屏幕上显示,不进采集画面(2026-10-28 浏览器截图已确认);音频不用环回,改用 hook 截 WASAPI,按实例推流(1.8) |
 | 消息注入的覆盖面 | 用 Raw Input / DirectInput / XInput 或主动查询系统状态的应用收不到 | P2 hook 层补齐 |
 | 弹出窗口 | 菜单、tooltip 是独立顶层窗口 | P1.6 按进程枚举并合成 |
 | OLE 拖放 | `DoDragDrop` 跟踪真实鼠标,hook 难以覆盖 | 暂不支持,列入兼容性说明 |
@@ -234,7 +239,7 @@ cyber_remote/
 | 注入 DLL 依赖 VC++ 运行库 | hook DLL 动态链接 `VCRUNTIME140.dll` 和 UCRT(2026-11-05 dumpbin 实测,x86 和 x64 相同)。目标机缺对应位宽的运行库时 `LoadLibraryW` 失败,该实例不受隔离 | 发布前改成静态 CRT(`+crt-static`,要写进 `.cargo/config.toml`,会影响整个 workspace 的构建);DLL 装好后给 agent 回执,超时就拒绝该实例 |
 | 窗口最小化 | WGC 采集不到最小化窗口 | 阻止最小化,或将窗口移到屏幕外 |
 | 消费级显卡 NVENC 并发上限 | 限制同时编码的路数 | 实测;多路时考虑混合编码后端 |
-| 多开时声音串流 | 整机环回下每一路都听到所有实例;19045 不能按进程环回 | Win11/Server 2022 起用按进程环回;19045 上给每个实例一个虚拟音频设备 + 按应用指定输出设备,或在 hook DLL 里截 WASAPI |
+| 多开时声音串流 | 整机环回下每一路都听到所有实例;19045 不能按进程环回 | 已用 hook 截 WASAPI 解决(1.8)。剩余限制:要 `--hook`;独占模式和空间音频截不到;在子进程里放声音的程序截不到;注入前建好的流只能靠猜格式(采样率猜错会变调) |
 | 开发机 Win10 已过支持期 | 消费版延长更新 2026-10-13 结束;黄框、不能按进程环回、WGC 拒绝 tool window 都是旧系统的限制 | 生产基线待定(第 8 节) |
 | 没有拥塞控制 | 固定 CBR,带宽一掉延迟暴涨,丢包后只能整帧 IDR | 接 webrtc-rs 0.21 自带的 GCC(`configure_congestion_control`),目标码率交给 `nvEncReconfigureEncoder` |
 | 浏览器端缓冲 | 0.8 实测"缓冲+等显示"p50 60 ms,是总延迟的大头;`jitterBufferTarget = 0` 只是目标,不是上限 | 已加 playout-delay 扩展(min=max=0),降到 p50 27 ms;再往下要换 WebCodecs + canvas,绕开 video 元素的合成管线 |

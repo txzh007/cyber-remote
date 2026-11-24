@@ -1,7 +1,8 @@
 //! 输入隔离:和注入目标进程里的 hook DLL 通信(协议见 `hook-abi`)。
 //!
 //! `attach` 建命名共享内存和就绪事件,把 DLL 注入目标进程,等 DLL 报告钩子已启用。
-//! 之后输入线程用 `publish` 写按键、光标、窗口快照,用 `push_raw` 写 Raw Input 事件。
+//! 之后输入线程用 `publish` 写按键、光标、窗口快照,用 `push_raw` 写 Raw Input 事件;
+//! 声音线程通过 `audio()` 拿到声音环的句柄,读 hook 截下来的 PCM。
 //! `Drop` 时清掉 `FLAG_ACTIVE`,目标进程里的钩子随即回落到真实输入。
 //!
 //! 只支持 64 位目标:32 位目标里 `LoadLibraryW` 的地址和本进程不同,还没做。
@@ -9,11 +10,12 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use hook_abi::{
-    FLAG_ACTIVE, FLAG_OVERRIDE_CURSOR, FLAG_OVERRIDE_FOREGROUND, RawEvent, Shared, Snapshot,
-    mapping_name, raw_handle, ready_event_name,
+    AudioRing, FLAG_ACTIVE, FLAG_OVERRIDE_CURSOR, FLAG_OVERRIDE_FOREGROUND, RawEvent, Shared,
+    Snapshot, mapping_name, raw_handle, ready_event_name,
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM,
@@ -49,17 +51,43 @@ impl Drop for Owned {
     }
 }
 
+/// 共享内存的视图,出作用域就取消映射。`HookLink` 和声音线程各持一份 `Arc`,
+/// 最后一个放手时才取消映射,声音线程比 `HookLink` 晚退出也不会读到已释放的内存
+struct View(*mut Shared);
+
+// 指向跨进程共享内存,并发由 hook-abi 的 seqlock、环形缓冲和“单写方”约定保证
+unsafe impl Send for View {}
+unsafe impl Sync for View {}
+
+impl Drop for View {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.0.cast() });
+        }
+    }
+}
+
+/// 声音线程用的句柄:能读 `Shared::audio`,并让映射活到它放手为止。可以交给别的线程
+#[derive(Clone)]
+pub struct AudioLink(Arc<View>);
+
+impl AudioLink {
+    pub fn ring(&self) -> &AudioRing {
+        // 视图由这个 Arc 撑着,比借用活得久
+        unsafe { &(*(self.0).0).audio }
+    }
+}
+
 /// 和一个目标进程的连接。多个浏览器会话共用一个,调用方用 Mutex 保证只有一个写方
 pub struct HookLink {
     hwnd: HWND,
     /// 只为 Drop 时关句柄
     _mapping: Owned,
-    view: *mut Shared,
+    view: Arc<View>,
     ready: Owned,
 }
 
-// view 指向跨进程共享内存,并发由 hook-abi 的 seqlock 和“单写方”约定保证,
-// 单写方由调用方的 Mutex 保证
+// HWND 是裸指针;视图的并发约定见 `View`,单写方由调用方的 Mutex 保证
 unsafe impl Send for HookLink {}
 
 /// 接管状态下的基础快照:实例认为自己在前台、有焦点,光标是虚拟的。`cursor` 是屏幕坐标。
@@ -92,7 +120,12 @@ pub fn client_center(hwnd: HWND) -> POINT {
 
 impl HookLink {
     fn shared(&self) -> &Shared {
-        unsafe { &*self.view }
+        unsafe { &*self.view.0 }
+    }
+
+    /// 声音环的句柄,给声音线程用
+    pub fn audio(&self) -> AudioLink {
+        AudioLink(Arc::clone(&self.view))
     }
 
     /// 整块写入快照
@@ -113,11 +146,9 @@ impl HookLink {
 
 impl Drop for HookLink {
     fn drop(&mut self) {
-        // 清掉 FLAG_ACTIVE:目标进程里的钩子回落到真实输入。映射本身随目标进程的视图继续存在
+        // 清掉 FLAG_ACTIVE:目标进程里的钩子回落到真实输入。映射本身随目标进程的视图继续存在,
+        // 本进程的视图在最后一个 `Arc<View>` 放手时取消映射
         self.shared().write_snapshot(&Snapshot::default());
-        unsafe {
-            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.view.cast() });
-        }
     }
 }
 
@@ -198,7 +229,8 @@ pub fn attach(hwnd: HWND, dll: &Path) -> Result<HookLink> {
     if view.Value.is_null() {
         bail!("映射共享内存失败: {}", windows::core::Error::from_thread());
     }
-    let mut link = HookLink { hwnd, _mapping: mapping, view: view.Value.cast(), ready };
+    // 视图一建好就交给 View 管,后面任何一步失败 return 时都会取消映射
+    let mut link = HookLink { hwnd, _mapping: mapping, view: Arc::new(View(view.Value.cast())), ready };
     link.shared().init();
     link.publish(&base_snapshot(hwnd, hwnd, client_center(hwnd)));
 

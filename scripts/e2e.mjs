@@ -1,5 +1,6 @@
 // 端到端验证:起两路 agent(各带一个新开的 gametest)和一个无头浏览器,每路开一个页面,
 // 用 CDP 发键鼠,再从 gametest 的窗口标题读它各自看到的状态,确认两路输入互不干扰。
+// 最后一个阶段验证声音:A 的 gametest 放 440 Hz、B 的放 880 Hz,每个页面只能听到自己那路。
 // 用法: cargo build --workspace 之后  node scripts/e2e.mjs
 // 产物在 target/e2e/:每路 agent 的日志和浏览器里最后一帧画面。
 import { spawn, execFileSync } from 'node:child_process';
@@ -16,6 +17,8 @@ const out = path.join(root, 'target', 'e2e');
 mkdirSync(out, { recursive: true });
 
 const PORTS = [8091, 8092];
+// 每路的 gametest 放的单音(Hz),和 PORTS 一一对应
+const TONES = [440, 880];
 const DEBUG_PORT = 9333;
 const BROWSERS = [
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -28,12 +31,13 @@ function check(name, ok, detail = '') {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  ' + detail : ''}`);
 }
 
-// 起一路 agent:新开一个 gametest 并装输入隔离。stdin 保持管道,关掉它 agent 会自己退出
-function startAgent(port) {
+// 起一路 agent:新开一个 gametest(循环放 tone 赫兹的单音)并装输入隔离。
+// stdin 保持管道,关掉它 agent 会自己退出
+function startAgent(port, tone) {
   const log = openSync(path.join(out, `agent-${port}.log`), 'w');
   const child = spawn(
     path.join(bin, 'agent.exe'),
-    ['--app', 'gametest', '--new', '--hook', '--port', String(port), '--exit-on-stdin-close'],
+    ['--app', 'gametest', '--new', '--hook', '--port', String(port), '--exit-on-stdin-close', '--', '--tone', String(tone)],
     { stdio: ['pipe', log, log], windowsHide: true },
   );
   child.exited = new Promise((resolve) => child.once('exit', resolve));
@@ -126,7 +130,44 @@ async function saveFrame(p, name) {
   writeFileSync(path.join(out, name), Buffer.from(url.split(',')[1], 'base64'));
 }
 
-const agents = PORTS.map(startAgent);
+// 页面里 audio 的 inbound-rtp 统计
+const audioStats = (p) =>
+  p.page.eval(`(async () => {
+    const report = await pc.getStats();
+    let a = null;
+    report.forEach((s) => { if (s.type === 'inbound-rtp' && s.kind === 'audio') a = s; });
+    return a && { packets: a.packetsReceived, bytes: a.bytesReceived, level: a.audioLevel, lost: a.packetsLost };
+  })()`);
+
+// 给 <audio> 的流接一个 AnalyserNode(fftSize 8192),等 1 秒取频谱峰值。
+// 频谱全是 -Infinity 说明没拿到数据:finite 为 false,原样上报,不当成通过
+const spectrumPeak = (p) =>
+  p.page.eval(`(async () => {
+    const stream = document.getElementById('audio').srcObject;
+    if (!stream) return { error: 'audio.srcObject 是空的' };
+    const ctx = new AudioContext();
+    await ctx.resume();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 8192;
+    analyser.smoothingTimeConstant = 0;
+    ctx.createMediaStreamSource(stream).connect(analyser);
+    await new Promise((r) => setTimeout(r, 1000));
+    const bins = new Float32Array(analyser.frequencyBinCount);
+    analyser.getFloatFrequencyData(bins);
+    let peak = 0;
+    for (let i = 1; i < bins.length; i++) if (bins[i] > bins[peak]) peak = i;
+    const out = {
+      hz: peak * ctx.sampleRate / analyser.fftSize,
+      db: Number.isFinite(bins[peak]) ? bins[peak] : null,
+      finite: bins.some((v) => Number.isFinite(v)),
+      state: ctx.state,
+      rate: ctx.sampleRate,
+    };
+    await ctx.close();
+    return out;
+  })()`);
+
+const agents = PORTS.map((port, i) => startAgent(port, TONES[i]));
 const pids = [];
 const pages = [];
 let browser = null;
@@ -271,6 +312,24 @@ try {
   const after = state(A.pid);
   check('相对模式: 虚拟光标按增量累加(不被窗口消息重置)', !!relHeld,
     `cursor ${beforeRel.cursor}→${after?.cursor} 期望 x +${more}`);
+
+  // 阶段 5:声音。A 的 gametest 放 440 Hz、B 的放 880 Hz;两个页面各自只能听到自己那一路,
+  // 频谱峰值对得上就证明多开时声音是分开的
+  for (const [i, p] of pages.entries()) {
+    const want = TONES[i];
+    const label = `页面 ${p.port}`;
+    const s1 = await audioStats(p);
+    await sleep(1000);
+    const s2 = await audioStats(p);
+    const got = s1 && s2 ? s2.packets - s1.packets : null;
+    check(`${label}: 1 秒内收到音频包 > 50`, got > 50, `packetsReceived ${s1?.packets}→${s2?.packets}`);
+    check(`${label}: audioLevel > 0.01`, s2?.level > 0.01, `audioLevel=${s2?.level}`);
+    const sp = await spectrumPeak(p);
+    const detail = sp.error ?? (sp.finite
+      ? `峰值 ${sp.hz.toFixed(1)} Hz ${sp.db?.toFixed(1)} dB(期望 ${want}±15,AudioContext ${sp.state} ${sp.rate} Hz)`
+      : `AnalyserNode 的频谱全是 -Infinity,没有拿到音频数据(AudioContext ${sp.state} ${sp.rate} Hz)`);
+    check(`${label}: 频谱峰值在 ${want}±15 Hz`, !!sp.finite && Math.abs(sp.hz - want) <= 15, detail);
+  }
 
   // 整条链路(采集、编码、WebRTC、解码)最后一帧画面,留着人工看
   for (const [i, p] of pages.entries()) await saveFrame(p, `frame-${PORTS[i]}.png`);

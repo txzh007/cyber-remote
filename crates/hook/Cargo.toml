@@ -15,4 +15,11 @@ hook-abi.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 minhook = "0.9.0"
-windows.workspace = true
+# 声音钩子建临时输出流取虚表地址:IMMDevice::Activate 要 StructuredStorage 和 Variant。
+# KSDATAFORMAT_SUBTYPE 在 KernelStreaming 和 Multimedia 里,为这两个常量不值得多编两个大模块,代码里自己定义
+windows = { workspace = true, features = [
+    "Win32_Media_Audio",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_SystemInformation",
+    "Win32_System_Variant",
+] }

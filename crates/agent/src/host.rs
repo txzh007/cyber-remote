@@ -48,6 +48,13 @@ pub struct EncodedFrame {
     pub probe: Option<ProbeTiming>,
 }
 
+/// 一帧编码好的音频(Opus)
+#[derive(Clone)]
+pub struct AudioFrame {
+    pub data: Bytes,
+    pub duration: Duration,
+}
+
 /// 延迟探针在 agent 内各环节的时刻
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeTiming {
@@ -81,6 +88,10 @@ impl InputEvent {
 pub trait Host: Send + Sync + 'static {
     /// 编码帧的订阅端;没人订阅时帧直接丢弃
     fn subscribe(&self) -> broadcast::Receiver<EncodedFrame>;
+    /// 音频帧的订阅端;这个后端没有声音(不支持、没开输入隔离、被关掉)时是 None
+    fn subscribe_audio(&self) -> Option<broadcast::Receiver<AudioFrame>> {
+        None
+    }
     /// 让下一帧编成关键帧
     fn request_keyframe(&self);
     /// 给一个浏览器会话开输入通道。发送端全部丢弃后,后端松开这个会话按下的所有键

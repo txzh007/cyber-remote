@@ -3,6 +3,7 @@
 //! 每个钩子一个 `Hook<F>`:装钩子时 MinHook 返回的蹦床(调用原函数的入口)存进去,
 //! 替身在不需要覆盖时用它回落到真实 API。
 
+mod audio;
 mod cursor;
 mod keys;
 mod pad;
@@ -15,6 +16,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use minhook::MinHook;
 
+pub use audio::install as install_audio;
 pub use pad::install_loaded_xinput;
 
 /// 一个被钩函数的原始入口。`F` 是该函数的 `unsafe extern "system" fn` 类型
@@ -38,6 +40,16 @@ impl<F: Copy> Hook<F> {
             .map_err(|e| format!("{module}!{name}: {e}"))?;
         self.original.store(original, Ordering::Release);
         Ok(())
+    }
+
+    /// 给地址 `target` 创建钩子并立刻启用。COM 方法没有导出名,只能按虚表里取出的地址装;
+    /// 蹦床先存好再启用,启用之后随时可能有线程进替身
+    pub fn install_at(&self, target: *mut c_void, detour: F) -> Result<(), String> {
+        let detour_ptr = unsafe { core::mem::transmute_copy::<F, *mut c_void>(&detour) };
+        let original = unsafe { MinHook::create_hook(target, detour_ptr) }
+            .map_err(|e| format!("{target:p}: {e}"))?;
+        self.original.store(original, Ordering::Release);
+        unsafe { MinHook::enable_hook(target) }.map_err(|e| format!("{target:p}: {e}"))
     }
 
     /// 原函数。没装上时是 None,替身此时按“不覆盖”的缺省值返回

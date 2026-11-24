@@ -25,6 +25,8 @@ serde_json = "1.0.154"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 bytes = "1.12.1"
+# libopus 的纯 Rust 转译版,不用 cmake 编 C
+unsafe-libopus = "0.2.0"
 # 启动器界面;glow 后端比 wgpu 依赖少
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
 rfd = { version = "0.16.1", default-features = false }

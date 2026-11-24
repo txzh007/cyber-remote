@@ -10,7 +10,9 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DeleteDC, DeleteObject,
@@ -18,7 +20,11 @@ use windows::Win32::Graphics::Gdi::{
     PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
     TextOutW, UpdateWindow,
 };
+use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_LOOP, SND_MEMORY};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetKeyNameTextW, GetKeyState};
 use windows::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
 use windows::Win32::UI::Input::{
@@ -36,7 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
     WS_VISIBLE,
 };
-use windows::core::{PCWSTR, Result, w};
+use windows::core::{HSTRING, PCWSTR, Result, w};
 
 /// agent 按这个类名找窗口
 const CLASS_NAME: PCWSTR = w!("CyberRemoteGameTest");
@@ -131,6 +137,20 @@ fn main() -> Result<()> {
 
         // --latency:延迟测量用的黑白窗口(见 latency_wndproc)
         let latency = std::env::args().any(|a| a == "--latency");
+        // --tone HZ:等 hook 装好再循环放一个单音,测声音推流用;
+        // --tone-now HZ:一启动就放,输出流在注入之前建好,用来造 hook 没见过 Initialize 的 16 位流。
+        // 都不带就没有声音
+        let tone = tone_arg("--tone-now")
+            .map(|hz| (hz, false))
+            .or_else(|| tone_arg("--tone").map(|hz| (hz, true)));
+        if let Some((hz, wait)) = tone {
+            std::thread::spawn(move || {
+                if wait {
+                    wait_for_hook();
+                }
+                play_tone(hz);
+            });
+        }
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -198,6 +218,71 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `flag`(`--tone` 或 `--tone-now`)后面的整数赫兹数。不带或格式不对都当没有
+fn tone_arg(flag: &str) -> Option<u32> {
+    let mut args = std::env::args();
+    args.find(|a| a == flag)?;
+    args.next()?.parse().ok().filter(|hz| (1..=20_000).contains(hz))
+}
+
+/// 等 agent 的 hook 装好声音钩子,再开始放音。hook 只认得装好之后才建的输出流的格式,注入之前建好的流
+/// 只能猜成混音格式,而这段 WAV 是 16 位的,猜不对(hook 会放弃这一路,远端听不到)。
+/// 就绪事件是 agent 注入前建的,hook 装完全部钩子(声音钩子成功或失败都算)才置位,手动复位,
+/// agent 也在等它,两边不会抢信号。所以每 50 ms 试着打开它,打开后等它置位,不靠猜时间。
+/// 最多等 10 秒;没带 --hook(没有这个事件)或 hook 没装好时到点照常放,单独运行 gametest --tone 也能听到
+fn wait_for_hook() {
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    let name = HSTRING::from(hook_abi::ready_event_name(unsafe { GetCurrentProcessId() }));
+    let start = Instant::now();
+    while start.elapsed() < TIMEOUT {
+        if let Ok(event) = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &name) } {
+            let left = TIMEOUT.saturating_sub(start.elapsed()).as_millis() as u32;
+            let ready = unsafe { WaitForSingleObject(event, left) } == WAIT_OBJECT_0;
+            unsafe {
+                let _ = CloseHandle(event);
+            }
+            if ready {
+                return;
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!("gametest: {} 秒内没等到 hook 就绪({name}),照常出声", TIMEOUT.as_secs());
+}
+
+/// 在内存里生成 1 秒的 48 kHz、16 位立体声 WAV(幅度 0.2 的正弦波),用 PlaySound 循环播放。
+/// HZ 是整数,1 秒正好是整数个周期,首尾相接循环没有断点。
+/// 声音由 winmm 在本进程里放,走本进程自己的 WASAPI 输出流,hook 才截得到
+fn play_tone(hz: u32) {
+    const RATE: u32 = 48_000;
+    let data_len = RATE * 4;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&2u16.to_le_bytes()); // 声道数
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 4).to_le_bytes()); // 每秒字节数
+    wav.extend_from_slice(&4u16.to_le_bytes()); // 每帧字节数
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for i in 0..RATE {
+        let phase = std::f64::consts::TAU * f64::from(hz) * f64::from(i) / f64::from(RATE);
+        let s = ((0.2 * phase.sin()) * 32767.0).round() as i16;
+        wav.extend_from_slice(&s.to_le_bytes());
+        wav.extend_from_slice(&s.to_le_bytes());
+    }
+    // SND_MEMORY 要求这块内存在播放期间一直有效,直接 leak
+    let wav: &'static [u8] = wav.leak();
+    unsafe {
+        let _ = PlaySoundW(PCWSTR(wav.as_ptr().cast()), None, SND_MEMORY | SND_ASYNC | SND_LOOP);
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

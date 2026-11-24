@@ -5,5 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dependencies]
+# --tone 要打开 hook 的就绪事件,事件名由它给出,不在这里再抄一份
+hook-abi.workspace = true
+
 [target.'cfg(windows)'.dependencies]
-windows.workspace = true
+# --tone 用 PlaySoundW 循环放一段正弦波
+windows = { workspace = true, features = ["Win32_Media_Audio"] }

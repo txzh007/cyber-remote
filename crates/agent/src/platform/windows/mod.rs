@@ -1,5 +1,6 @@
 //! Windows 后端:WGC 按窗口采集(或 DXGI 桌面复制采整块屏)→ NVENC;输入走窗口消息注入,可选 hook DLL 做输入隔离。
 
+mod audio;
 mod capture;
 mod compositor;
 mod display;
@@ -13,7 +14,7 @@ use std::sync::{Arc, mpsc};
 use anyhow::{Result, bail};
 use tokio::sync::broadcast;
 
-use crate::host::{EncodedFrame, Host, InputEvent, Stream, Target};
+use crate::host::{AudioFrame, EncodedFrame, Host, InputEvent, Stream, Target};
 
 /// 进程级初始化:让窗口坐标和 WGC 帧都用物理像素,裁剪才对得上
 pub fn init() {
@@ -58,6 +59,10 @@ impl Host for capture::Pipeline {
         self.frames.subscribe()
     }
 
+    fn subscribe_audio(&self) -> Option<broadcast::Receiver<AudioFrame>> {
+        self.audio.as_ref().map(|tx| tx.subscribe())
+    }
+
     fn request_keyframe(&self) {
         capture::Pipeline::request_keyframe(self);
     }
@@ -71,7 +76,9 @@ impl Host for capture::Pipeline {
     }
 
     fn shutdown(&self) {
-        // 先撤钩子:目标进程里的钩子立刻回落到真实输入,再还原窗口边框、位置和任务栏按钮
+        // 先停声音线程:心跳清零,目标的声音立刻回到主机扬声器。
+        // 再撤钩子:目标进程里的钩子回落到真实输入,最后还原窗口边框、位置和任务栏按钮
+        self.stop_audio();
         self.detach_hook();
         self.restore_window();
         if let Some(hwnd) = self.window() {

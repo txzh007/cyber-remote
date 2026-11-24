@@ -7,17 +7,22 @@
 //! 同步:快照块(按键、光标、窗口、手柄)用 seqlock(`seq` 为奇数表示正在写);
 //! Raw Input 用环形缓冲,agent 递增 `raw_head`,把绝对序号编进伪造的 `HRAWINPUT`
 //! 一起 `PostMessage(WM_INPUT)`,hook 用序号对 `RAW_RING` 取模读回对应事件。
+//!
+//! 唯一方向相反的是声音:`Shared::audio` 是 hook 写、agent 读的环形缓冲(hook 截下目标进程
+//! 写给 WASAPI 的 PCM),只有它的心跳 `alive_ms` 还是 agent 写、hook 读。所以映射必须是
+//! 读写的,hook 只许碰 `audio` 里的 `head` 和数据区。
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// 映射头部的校验字,防止读到未初始化或别的进程的内存
 pub const MAGIC: u32 = 0x4359_4248; // "CYBH"
 /// 布局版本,agent 与 DLL 不一致时 DLL 拒绝挂钩
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 /// Raw Input 环形缓冲槽位数,必须是 2 的幂
 pub const RAW_RING: usize = 256;
 
@@ -60,7 +65,7 @@ pub fn ready_event_name(pid: u32) -> String {
 }
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, Ordering, fence};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Snapshot.flags 的位
 pub const FLAG_OVERRIDE_CURSOR: u32 = 1 << 0;
@@ -142,8 +147,199 @@ impl Default for Snapshot {
     }
 }
 
+/// 声音环形缓冲的字节数,必须是 2 的幂
+pub const AUDIO_RING_BYTES: usize = 1 << 20;
+/// 包长都是它的倍数,回绕时环尾剩下的空间一定放得下包头
+pub const AUDIO_ALIGN: usize = 32;
+/// agent 的心跳超过这么久没更新,hook 就不截也不静音(agent 崩了,声音自动回主机扬声器)
+pub const AUDIO_ALIVE_MS: u64 = 300;
+
+/// 采样格式,值写进 `AudioHeader::format`
+pub const AUDIO_F32: u16 = 1;
+pub const AUDIO_I16: u16 = 2;
+/// 3 字节紧凑
+pub const AUDIO_I24: u16 = 3;
+/// 也用于 32 位容器里的 24 位
+pub const AUDIO_I32: u16 = 4;
+pub const AUDIO_U8: u16 = 5;
+
+/// `AudioHeader::flags` 的位:这段是静音,没有数据,只占 `frames` 帧的时间
+pub const AUDIO_PACKET_SILENT: u32 = 1;
+/// `AudioHeader::flags` 的位:hook 放弃了这一路(注入前就建好的流,猜的格式不对),之后不会再有
+/// 这一路的包。`frames` 为 0,没有数据;读方收到就把这一路从混音里移走
+pub const AUDIO_PACKET_ABANDONED: u32 = 2;
+/// 回绕填充包的流编号,读方直接跳过
+pub const AUDIO_STREAM_PAD: u32 = u32::MAX;
+
+const AUDIO_HEADER_BYTES: usize = 32;
+/// 单个包(含包头)的最大长度:数据最多 `AUDIO_RING_BYTES / 4`,再向上对齐
+const AUDIO_MAX_PACKET: usize = (AUDIO_HEADER_BYTES + AUDIO_RING_BYTES / 4).next_multiple_of(AUDIO_ALIGN);
+/// 读方能信的最大积压。写方每次先写 PAD 再写整包,最多比已公布的 `head` 多出两个最大包,
+/// 这一段盖掉的正是环里最旧的数据,所以可读的上限要把它扣掉
+const AUDIO_SAFE_BYTES: u64 = (AUDIO_RING_BYTES - 2 * AUDIO_MAX_PACKET) as u64;
+
+/// 声音包头,环里每个包以它开头,正好 32 字节
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AudioHeader {
+    /// 整个包的字节数(含包头和对齐填充),`AudioRing::write` 写入时自己填
+    pub len: u32,
+    /// 流编号(hook 里每个 `IAudioRenderClient` 一个);`AUDIO_STREAM_PAD` 是填充包
+    pub stream: u32,
+    pub rate: u32,
+    /// 这个包占的帧数
+    pub frames: u32,
+    /// `AUDIO_PACKET_*`
+    pub flags: u32,
+    pub channels: u16,
+    /// `AUDIO_F32` 等
+    pub format: u16,
+    pub _pad: [u32; 2],
+}
+
+/// 声音环形缓冲:hook 写,agent 读,方向和 `Shared` 里其他字段相反。
+///
+/// `head` 是写入的字节总数(绝对位置,不回绕),只有 hook 写;每个包长是 32 的倍数,
+/// 数据先落地,最后才 Release 公布 `head`。`alive_ms` 反过来是 agent 写的心跳。
+#[repr(C)]
+pub struct AudioRing {
+    pub head: AtomicU64,
+    /// agent 的心跳(`GetTickCount64`),0 表示 agent 没在收
+    pub alive_ms: AtomicU64,
+    data: UnsafeCell<[u8; AUDIO_RING_BYTES]>,
+}
+
+// 数据区的并发访问由 head 的 Release/Acquire 和读方的覆盖检测约束,见 write / drain
+unsafe impl Sync for AudioRing {}
+
+impl AudioRing {
+    /// hook:写一个包。包长 = 包头 + 数据向上对齐到 32;数据比 `AUDIO_RING_BYTES / 4` 大就返回 false。
+    /// 到环尾放不下时,先在当前位置写一个 PAD 包占满剩余空间,新包从环头开始。
+    ///
+    /// # Safety
+    /// 同一时刻只能有一个写者,调用方自己保证(hook 里靠进程内的锁)
+    pub unsafe fn write(&self, mut header: AudioHeader, data: &[u8]) -> bool {
+        if data.len() > AUDIO_RING_BYTES / 4 {
+            return false;
+        }
+        let len = (AUDIO_HEADER_BYTES + data.len()).next_multiple_of(AUDIO_ALIGN);
+        let mut head = self.head.load(Ordering::Relaxed);
+        let mut pos = head as usize & (AUDIO_RING_BYTES - 1);
+        let remain = AUDIO_RING_BYTES - pos;
+        if remain < len {
+            let pad = AudioHeader { len: remain as u32, stream: AUDIO_STREAM_PAD, ..Default::default() };
+            unsafe { self.put(pos, header_bytes(&pad)) };
+            head += remain as u64;
+            pos = 0;
+        }
+        header.len = len as u32;
+        unsafe {
+            self.put(pos, header_bytes(&header));
+            self.put(pos + AUDIO_HEADER_BYTES, data);
+            // 对齐填充补零,读方拿到的数据后面是确定的零而不是上一圈的残留
+            for i in AUDIO_HEADER_BYTES + data.len()..len {
+                core::ptr::write_volatile(self.base().add(pos + i), 0);
+            }
+        }
+        // 包头和数据先落地,再公布 head
+        self.head.store(head + len as u64, Ordering::Release);
+        true
+    }
+
+    /// hook:agent 的心跳是不是还新鲜。过期或从没写过(0)就不截也不静音
+    pub fn alive(&self, now_ms: u64) -> bool {
+        let t = self.alive_ms.load(Ordering::Relaxed);
+        t != 0 && now_ms.saturating_sub(t) < AUDIO_ALIVE_MS
+    }
+
+    fn base(&self) -> *mut u8 {
+        self.data.get().cast()
+    }
+
+    /// volatile 逐字节写进环里。`pos + src.len()` 不许越过环尾
+    unsafe fn put(&self, pos: usize, src: &[u8]) {
+        debug_assert!(pos + src.len() <= AUDIO_RING_BYTES);
+        let dst = unsafe { self.base().add(pos) };
+        for (i, &b) in src.iter().enumerate() {
+            unsafe { core::ptr::write_volatile(dst.add(i), b) };
+        }
+    }
+
+    /// volatile 逐字节从环里读出
+    unsafe fn take(&self, pos: usize, dst: &mut [u8]) {
+        debug_assert!(pos + dst.len() <= AUDIO_RING_BYTES);
+        let src = unsafe { self.base().add(pos) };
+        for (i, d) in dst.iter_mut().enumerate() {
+            *d = unsafe { core::ptr::read_volatile(src.add(i)) };
+        }
+    }
+}
+
+fn header_bytes(h: &AudioHeader) -> &[u8] {
+    unsafe { core::slice::from_raw_parts((h as *const AudioHeader).cast(), AUDIO_HEADER_BYTES) }
+}
+
+/// agent:从环里按序取包。只能有一个读者
+pub struct AudioReader {
+    /// 下一个要读的绝对位置
+    tail: u64,
+    scratch: Vec<u8>,
+}
+
+impl AudioReader {
+    /// 从当前 head 开始读,不管之前积压了什么
+    pub fn new(ring: &AudioRing) -> Self {
+        Self { tail: ring.head.load(Ordering::Acquire), scratch: Vec::new() }
+    }
+
+    /// 取走已公布的全部包,逐个回调(PAD 包不回调);回调拿到的数据带着对齐填充,
+    /// 调用方按 `frames` 和格式自己截取。返回这次是否丢过数据(读得太慢被写方追上,或包头不对)。
+    ///
+    /// 写方不等读方,所以读完要再看一次 head:读的过程中被覆盖的包整个丢掉,不回调
+    pub fn drain(&mut self, ring: &AudioRing, mut f: impl FnMut(&AudioHeader, &[u8])) -> bool {
+        let mut lost = false;
+        let head = ring.head.load(Ordering::Acquire);
+        if head.wrapping_sub(self.tail) > AUDIO_SAFE_BYTES {
+            self.tail = head;
+            lost = true;
+        }
+        while self.tail < head {
+            let pos = self.tail as usize & (AUDIO_RING_BYTES - 1);
+            let mut raw = [0u8; AUDIO_HEADER_BYTES];
+            unsafe { ring.take(pos, &mut raw) };
+            let h: AudioHeader = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) };
+            let len = h.len as usize;
+            let sane = len >= AUDIO_HEADER_BYTES
+                && len % AUDIO_ALIGN == 0
+                && len <= AUDIO_MAX_PACKET
+                && len <= AUDIO_RING_BYTES - pos
+                && len as u64 <= head - self.tail;
+            if !sane {
+                self.tail = head;
+                return true;
+            }
+            self.scratch.clear();
+            self.scratch.resize(len - AUDIO_HEADER_BYTES, 0);
+            unsafe { ring.take(pos + AUDIO_HEADER_BYTES, &mut self.scratch) };
+            // 数据读完才看 head:这之后 head 不会比读的时候更旧
+            fence(Ordering::Acquire);
+            let now = ring.head.load(Ordering::Acquire);
+            if now.wrapping_sub(self.tail) > AUDIO_SAFE_BYTES {
+                self.tail = now;
+                return true;
+            }
+            if h.stream != AUDIO_STREAM_PAD {
+                f(&h, &self.scratch);
+            }
+            self.tail += len as u64;
+        }
+        lost
+    }
+}
+
 /// 整块共享内存的布局。agent 创建命名映射(OS 清零),调 `init` 写入校验字;
-/// hook 映射进来先 `valid()` 校验,再按 seqlock 读快照、按环形缓冲读 Raw Input。
+/// hook 映射进来先 `valid()` 校验,再按 seqlock 读快照、按环形缓冲读 Raw Input,
+/// 并往 `audio` 里写截下来的声音(这是唯一 hook 写 agent 读的部分)。
 ///
 /// 这块内存跨进程共享,另一边随时可能改写,所以非原子字段都放在 `UnsafeCell` 里
 /// (`repr(transparent)`,不改布局),只通过 volatile 读写访问。
@@ -157,6 +353,8 @@ pub struct Shared {
     raw_head: AtomicU32,
     snapshot: UnsafeCell<Snapshot>,
     raw: UnsafeCell<[RawEvent; RAW_RING]>,
+    /// 放在最后,前面的布局不动
+    pub audio: AudioRing,
 }
 
 // 并发访问由 seqlock 和环形缓冲的序号校验约束,见各方法
@@ -264,18 +462,33 @@ const _: () = assert!(core::mem::align_of::<Snapshot>() == 8);
 const _: () = assert!(core::mem::offset_of!(Snapshot, flags) == 32);
 const _: () = assert!(core::mem::offset_of!(Snapshot, pad) == 44);
 const _: () = assert!(core::mem::offset_of!(Snapshot, keys) == 56);
-const _: () = assert!(core::mem::size_of::<Shared>() == 16 + 312 + 28 * RAW_RING);
+const _: () = assert!(core::mem::size_of::<AudioHeader>() == AUDIO_HEADER_BYTES);
+const _: () = assert!(AUDIO_RING_BYTES.is_power_of_two() && AUDIO_RING_BYTES % AUDIO_ALIGN == 0);
+const _: () = assert!(core::mem::size_of::<AudioRing>() == 16 + AUDIO_RING_BYTES);
+const _: () = assert!(core::mem::size_of::<Shared>() == 16 + 312 + 28 * RAW_RING + 16 + AUDIO_RING_BYTES);
 const _: () = assert!(core::mem::align_of::<Shared>() == 8);
 const _: () = assert!(core::mem::offset_of!(Shared, snapshot) == 16);
 const _: () = assert!(core::mem::offset_of!(Shared, raw) == 328);
+const _: () = assert!(core::mem::offset_of!(Shared, audio) == 328 + 28 * RAW_RING);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{Layout, alloc_zeroed};
+
+    /// 在堆上直接分配全零的 T。映射由 OS 清零,测试里同样从全零开始;
+    /// `Shared` 和 `AudioRing` 都有 1 MiB,经栈搬一趟会爆栈
+    fn heap_zeroed<T>() -> Box<T> {
+        let layout = Layout::new::<T>();
+        unsafe {
+            let p = alloc_zeroed(layout).cast::<T>();
+            assert!(!p.is_null());
+            Box::from_raw(p)
+        }
+    }
 
     fn zeroed() -> Box<Shared> {
-        // 映射由 OS 清零,测试里同样从全零开始
-        unsafe { Box::new(core::mem::zeroed()) }
+        heap_zeroed()
     }
 
     #[test]
@@ -315,5 +528,219 @@ mod tests {
         assert_eq!(s.raw_from_handle(raw_handle(last)).unwrap().mouse_last_x, RAW_RING as i32 + 1);
         // 不带标记的句柄是系统真句柄
         assert!(s.raw_from_handle(0x1234_5678).is_none());
+    }
+
+    /// 第 seq 个包:`frames` 放 seq,`rate` 借来放数据长度,数据每个字节都是 seq 的低 8 位。
+    /// 读方回调里据此核对内容,串了位或读到残留都能看出来
+    fn audio_packet(seq: u32, size: usize) -> (AudioHeader, Vec<u8>) {
+        let h = AudioHeader {
+            stream: 1 + seq % 3,
+            rate: size as u32,
+            frames: seq,
+            channels: 2,
+            format: AUDIO_F32,
+            ..Default::default()
+        };
+        (h, vec![seq as u8; size])
+    }
+
+    /// 回调拿到的数据 = 原数据 + 补到 32 对齐的零
+    fn check_packet(h: &AudioHeader, d: &[u8]) {
+        let size = h.rate as usize;
+        assert_eq!(d.len(), (AUDIO_HEADER_BYTES + size).next_multiple_of(AUDIO_ALIGN) - AUDIO_HEADER_BYTES);
+        assert_eq!(h.len as usize, AUDIO_HEADER_BYTES + d.len());
+        assert!(d[..size].iter().all(|&b| b == h.frames as u8), "seq {} 的数据被串了", h.frames);
+        assert!(d[size..].iter().all(|&b| b == 0), "seq {} 的对齐填充不是零", h.frames);
+    }
+
+    #[test]
+    fn audio_header_is_32_bytes() {
+        assert_eq!(size_of::<AudioHeader>(), 32);
+        assert_eq!(size_of::<AudioRing>(), 16 + AUDIO_RING_BYTES);
+    }
+
+    #[test]
+    fn audio_roundtrip_wraps() {
+        let ring: Box<AudioRing> = heap_zeroed();
+        let mut reader = AudioReader::new(&ring);
+        // 大小不一的包:大包会撞上环尾放不下的情况,总量三圈多
+        let sizes = [3840usize, 17, 200_000, 1, 100_000, 31, 64, 250_000, 0, 992];
+        let (mut seq, mut written) = (0u32, 0u64);
+        while written < 3 * AUDIO_RING_BYTES as u64 + 1000 {
+            // 一批 1..=4 个包,一起读,顺序和内容都要对
+            let mut expect = vec![];
+            for _ in 0..1 + seq % 4 {
+                seq += 1;
+                let (h, d) = audio_packet(seq, sizes[seq as usize % sizes.len()]);
+                assert!(unsafe { ring.write(h, &d) });
+                written += (AUDIO_HEADER_BYTES + d.len()).next_multiple_of(AUDIO_ALIGN) as u64;
+                expect.push(seq);
+            }
+            let mut got = vec![];
+            let lost = reader.drain(&ring, |h, d| {
+                check_packet(h, d);
+                got.push(h.frames);
+            });
+            assert!(!lost);
+            assert_eq!(got, expect);
+        }
+        // head 比所有包长之和多出来的,就是回绕时写的 PAD 包
+        assert!(ring.head.load(Ordering::Relaxed) > written);
+        // 空读不回调也不报丢
+        assert!(!reader.drain(&ring, |_, _| panic!("没有新包")));
+    }
+
+    #[test]
+    fn audio_size_limit() {
+        let ring: Box<AudioRing> = heap_zeroed();
+        let mut reader = AudioReader::new(&ring);
+        let big = vec![7u8; AUDIO_RING_BYTES / 4];
+        let (h, _) = audio_packet(7, big.len());
+        assert!(unsafe { ring.write(h, &big) });
+        assert!(!unsafe { ring.write(h, &vec![0u8; AUDIO_RING_BYTES / 4 + 1]) });
+        let mut n = 0;
+        assert!(!reader.drain(&ring, |h, d| {
+            check_packet(h, d);
+            n += 1;
+        }));
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn audio_overrun_reports_lost_without_garbage() {
+        let ring: Box<AudioRing> = heap_zeroed();
+        let mut reader = AudioReader::new(&ring);
+        let mut seq = 0u32;
+        // 写超过一圈,一直不读
+        while ring.head.load(Ordering::Relaxed) < AUDIO_RING_BYTES as u64 * 3 / 2 {
+            seq += 1;
+            let (h, d) = audio_packet(seq, 3840);
+            assert!(unsafe { ring.write(h, &d) });
+        }
+        let mut called = 0;
+        assert!(reader.drain(&ring, |_, _| called += 1));
+        assert_eq!(called, 0, "被覆盖的数据不能回调");
+        // 重新同步之后,只收到新写的包
+        seq += 1;
+        let (h, d) = audio_packet(seq, 100);
+        assert!(unsafe { ring.write(h, &d) });
+        let mut got = vec![];
+        let lost = reader.drain(&ring, |h, d| {
+            check_packet(h, d);
+            got.push(h.frames);
+        });
+        assert!(!lost);
+        assert_eq!(got, vec![seq]);
+    }
+
+    #[test]
+    fn audio_backlog_limit() {
+        // 积压没到 AUDIO_SAFE_BYTES 就全收,过了就整段丢掉
+        for (backlog, expect_lost) in [(AUDIO_SAFE_BYTES - 10_000, false), (AUDIO_SAFE_BYTES + 10_000, true)] {
+            let ring: Box<AudioRing> = heap_zeroed();
+            let mut reader = AudioReader::new(&ring);
+            let mut count = 0;
+            while ring.head.load(Ordering::Relaxed) < backlog {
+                count += 1;
+                let (h, d) = audio_packet(count, 3840);
+                assert!(unsafe { ring.write(h, &d) });
+            }
+            let mut got = 0;
+            let lost = reader.drain(&ring, |h, d| {
+                check_packet(h, d);
+                got += 1;
+            });
+            assert_eq!(lost, expect_lost);
+            assert_eq!(got, if expect_lost { 0 } else { count });
+        }
+    }
+
+    /// 写方限速(约 10 MB/s,debug 构建里读方也跟得上)、读方隔一阵睡一觉被追上:
+    /// 收到的每个包都必须完整、序号只增不减,丢了就丢了,不许收到残留
+    #[test]
+    fn audio_concurrent_never_delivers_garbage() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let ring: Box<AudioRing> = heap_zeroed();
+        let mut reader = AudioReader::new(&ring);
+        let stop = AtomicBool::new(false);
+        let sizes = [3840usize, 60_000, 7, 30_000, 960, 31];
+        let (mut delivered, mut lost_times, mut last) = (0u32, 0u32, 0u32);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let (start, mut seq, mut bytes) = (Instant::now(), 0u32, 0u128);
+                while !stop.load(Ordering::Relaxed) {
+                    seq += 1;
+                    let (h, d) = audio_packet(seq, sizes[seq as usize % sizes.len()]);
+                    assert!(unsafe { ring.write(h, &d) });
+                    bytes += d.len() as u128;
+                    // 10 字节/微秒 = 10 MB/s
+                    while bytes > start.elapsed().as_micros() * 10 && !stop.load(Ordering::Relaxed) {
+                        std::thread::yield_now();
+                    }
+                }
+            });
+            let start = Instant::now();
+            let mut slept = false;
+            while start.elapsed() < Duration::from_millis(900) {
+                let lost = reader.drain(&ring, |h, d| {
+                    check_packet(h, d);
+                    assert!(h.frames > last, "序号倒退 {last} -> {}", h.frames);
+                    last = h.frames;
+                    delivered += 1;
+                });
+                lost_times += u32::from(lost);
+                // 中途睡 120 ms:写方这段时间写的比环能留的多,读方醒来必须重新同步
+                if !slept && start.elapsed() > Duration::from_millis(400) {
+                    slept = true;
+                    std::thread::sleep(Duration::from_millis(120));
+                } else {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        eprintln!("收到 {delivered} 个包,丢数据 {lost_times} 次");
+        assert!(delivered > 50);
+        assert!(lost_times > 0, "没有触发过丢数据路径");
+    }
+
+    #[test]
+    fn audio_abandoned_packet_is_header_only() {
+        // 和静音包的位不重叠;放弃包只有包头,读方能原样收到流编号和标志
+        assert_eq!(AUDIO_PACKET_ABANDONED & AUDIO_PACKET_SILENT, 0);
+        let ring: Box<AudioRing> = heap_zeroed();
+        let mut reader = AudioReader::new(&ring);
+        let h = AudioHeader {
+            stream: 3,
+            rate: 48_000,
+            channels: 2,
+            format: AUDIO_F32,
+            flags: AUDIO_PACKET_ABANDONED,
+            ..Default::default()
+        };
+        assert!(unsafe { ring.write(h, &[]) });
+        let mut got = vec![];
+        let lost = reader.drain(&ring, |h, d| got.push((h.stream, h.flags, h.frames, d.len())));
+        assert!(!lost);
+        assert_eq!(got, [(3, AUDIO_PACKET_ABANDONED, 0, 0)]);
+    }
+
+    #[test]
+    fn audio_alive_boundary() {
+        let ring: Box<AudioRing> = heap_zeroed();
+        // 从没写过心跳
+        assert!(!ring.alive(0));
+        assert!(!ring.alive(10_000));
+        ring.alive_ms.store(1000, Ordering::Relaxed);
+        assert!(ring.alive(1000));
+        assert!(ring.alive(1000 + AUDIO_ALIVE_MS - 1));
+        assert!(!ring.alive(1000 + AUDIO_ALIVE_MS));
+        // 两边取时刻有先后,心跳比 now 还新不算过期
+        assert!(ring.alive(990));
+        // agent 退出时清零
+        ring.alive_ms.store(0, Ordering::Relaxed);
+        assert!(!ring.alive(1000));
     }
 }

@@ -18,6 +18,8 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
+unsafe-libopus.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows.workspace = true
+# GetTickCount64:声音线程的心跳和 hook 用同一个时钟
+windows = { workspace = true, features = ["Win32_System_SystemInformation"] }
